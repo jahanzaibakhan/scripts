@@ -3,7 +3,7 @@
 # Purpose: To get a downloadable zip of database and web files.
 # Author: Jahanzaib Khan | Cloudways
 # Last Edited: 26/04/2024:10:28
-# Usage: curl -s https://raw.githubusercontent.com/jahanzaibkhan/scripts/main/backup.sh | bash 
+# Usage: curl -s https://raw.githubusercontent.com/jahanzaibakhan/scripts/main/backup.sh | bash 
 
 # Get the current working directory
 current_dir=$(pwd)
