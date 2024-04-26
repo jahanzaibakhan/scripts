@@ -1,8 +1,8 @@
 #!/bin/bash
 # Purpose: To install pm2 on the server
-# Author: Guman Singh | Cloudways
-# Last Edited: 12/09/2023:6:58
-# Usage: curl -s https://raw.githubusercontent.com/ThakurGumansingh/scripts/main/pm2.sh | bash
+# Author: Jahanzaib Khan | Cloudways
+# Last Edited: 26/04/2024:07:02
+# Usage: curl -s https://raw.githubusercontent.com/jahanzaibakhan/scripts/main/pm2-installation.sh | bash
 
 # Get the current user
 CURRENT_USER=$(whoami)
