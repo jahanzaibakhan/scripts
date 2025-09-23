@@ -78,7 +78,7 @@ echo "========== Server ID Report =========="
 for SERVER in "${SERVERS[@]}"; do
     echo "🔗 Connecting to $SERVER ..."
 
-    SERVER_ID=$(ssh -o BatchMode=yes -o ConnectTimeout=10 root@"$SERVER" "ls /home/ 2>/dev/null | grep -o '^[0-9]*' | head -n 1")
+    SERVER_ID=$(cng "$SERVER" "ls /home/ 2>/dev/null | grep -o '^[0-9]*' | head -n 1")
 
     if [ -n "$SERVER_ID" ]; then
         echo "✅ Server IP: $SERVER | Server ID: $SERVER_ID"
