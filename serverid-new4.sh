@@ -76,10 +76,11 @@ for server in "${servers[@]}"; do
     echo "========================================"
     echo "➡️ Connecting to server: $server"
 
-    # Run ls /home/ inside interactive shell to ensure cng alias loads
-    output=$(bash -i -c "cng server $server 'ls /home/'")
+    # Run ls /home/ via cng
+    output=$(bash -i -c "cng $server 'ls /home/' 2>/dev/null")
 
-    server_id=$(echo "$output" | grep -oE '^[0-9]+')
+    # Extract numeric ID (first directory like 96848.cloudwaysapps.com → 96848)
+    server_id=$(echo "$output" | grep -Eo '^[0-9]+' | head -n 1)
 
     echo "📌 Server IP: $server"
     echo "🆔 Server ID: $server_id"
