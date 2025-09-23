@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# List of server IPs
+# List of server IPs new
 servers=(
 149.28.173.88
 45.32.244.174
