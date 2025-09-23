@@ -1,6 +1,15 @@
 #!/bin/bash
 
-servers=(
+# ==================================================
+# Multi-server ID Fetch Script (Hardcoded IPs)
+# Author: Jahanzaib
+# ==================================================
+
+# SSH user (update if needed)
+USER="master"
+
+# Hardcoded server IPs
+SERVERS=(
 149.28.173.88
 45.32.244.174
 45.77.123.146
@@ -72,19 +81,22 @@ servers=(
 45.63.28.115
 )
 
-for server in "${servers[@]}"; do
+# Loop through all servers
+for SERVER in "${SERVERS[@]}"; do
     echo "========================================"
-    echo "➡️ Connecting to server: $server"
+    echo "➡️ Connecting to server: $SERVER"
 
-    # Run ls /home/ via cng
-    output=$(bash -i -c "cng $server 'ls /home/' 2>/dev/null")
+    SERVER_ID=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 $USER@$SERVER \
+        "ls /home/ 2>/dev/null | grep -m1 'cloudwaysapps.com'" | cut -d. -f1)
 
-    # Extract numeric ID from something like "96848.cloudwaysapps.com"
-    server_id=$(echo "$output" | grep -Eo '^[0-9]+(?=\.cloudwaysapps\.com)' | head -n 1)
+    echo "📌 Server IP: $SERVER"
+    if [[ -n "$SERVER_ID" ]]; then
+        echo "🆔 Server ID: $SERVER_ID"
+    else
+        echo "⚠️ Server ID: Not Found"
+    fi
 
-    echo "📌 Server IP: $server"
-    echo "🆔 Server ID: $server_id"
-    echo "⬅️ Disconnecting from $server"
+    echo "⬅️ Disconnecting from $SERVER"
     echo "========================================"
-    echo ""
+    echo
 done
