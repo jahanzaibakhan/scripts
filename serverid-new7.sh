@@ -1,14 +1,7 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# fetch_home_lists.sh
+# Connect to each server with cng, run `ls /home/`, then exit.
 
-# ==================================================
-# Multi-server ID Fetch Script (Hardcoded IPs)
-# Author: Jahanzaib
-# ==================================================
-
-# SSH user (update if needed)
-USER="master"
-
-# Hardcoded server IPs
 SERVERS=(
 149.28.173.88
 45.32.244.174
@@ -81,22 +74,21 @@ SERVERS=(
 45.63.28.115
 )
 
-# Loop through all servers
-for SERVER in "${SERVERS[@]}"; do
-    echo "========================================"
-    echo "➡️ Connecting to server: $SERVER"
-
-    SERVER_ID=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 $USER@$SERVER \
-        "ls /home/ 2>/dev/null | grep -m1 'cloudwaysapps.com'" | cut -d. -f1)
-
-    echo "📌 Server IP: $SERVER"
-    if [[ -n "$SERVER_ID" ]]; then
-        echo "🆔 Server ID: $SERVER_ID"
-    else
-        echo "⚠️ Server ID: Not Found"
-    fi
-
-    echo "⬅️ Disconnecting from $SERVER"
-    echo "========================================"
+echo "=== Start: $(date '+%F %T') ==="
+for server in "${SERVERS[@]}"; do
     echo
+    echo "----------------------------------------"
+    echo "➡️  Connecting to $server ..."
+    # feed the commands into the interactive cng session: list /home one-per-line, then exit
+    bash -i -c "printf 'ls -1 /home/\nexit\n' | cng $server"
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        echo "⚠️  Connection/command failed on $server (exit code $rc)"
+    else
+        echo "✅  Completed listing for $server"
+    fi
+    echo "⬅️  Disconnected from $server"
+    echo "----------------------------------------"
 done
+echo
+echo "=== Done: $(date '+%F %T') ==="
