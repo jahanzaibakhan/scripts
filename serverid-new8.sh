@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# fetch_home_lists.sh
-# Connect to each server with cng, run `ls /home/`, then exit.
-# Finally, show a summary table.
+# summary_home_list_table.sh
+# Connect to each server with cng, run ls /home/, and show summary as a table.
 
 SERVERS=(
 149.28.173.88
@@ -75,36 +74,12 @@ SERVERS=(
 45.63.28.115
 )
 
-declare -A SUMMARY
+echo "========= FINAL SUMMARY ========="
+printf "%-20s | %-15s\n" "Server IP" "Server ID"
+echo "---------------------+----------------"
 
-echo "=== Start: $(date '+%F %T') ==="
 for server in "${SERVERS[@]}"; do
-    echo
-    echo "----------------------------------------"
-    echo "➡️  Connecting to $server ..."
-    
-    # capture ls output into a variable
     result=$(bash -i -c "printf 'ls -1 /home/\nexit\n' | cng $server" 2>/dev/null)
-    rc=$?
-    
-    if [ $rc -ne 0 ]; then
-        echo "⚠️  Connection/command failed on $server (exit code $rc)"
-        SUMMARY["$server"]="(connection failed)"
-    else
-        echo "$result"
-        first_line=$(echo "$result" | head -n 1)
-        SUMMARY["$server"]="$first_line"
-        echo "✅  Completed listing for $server"
-    fi
-    
-    echo "⬅️  Disconnected from $server"
-    echo "----------------------------------------"
-done
-
-echo
-echo "=== Done: $(date '+%F %T') ==="
-echo
-echo "========= SUMMARY ========="
-for server in "${SERVERS[@]}"; do
-    printf "%-15s  %s\n" "$server" "${SUMMARY[$server]}"
+    server_id=$(echo "$result" | head -n 1 | sed 's/\.cloudwaysapps\.com//')
+    printf "%-20s | %-15s\n" "$server" "$server_id"
 done
