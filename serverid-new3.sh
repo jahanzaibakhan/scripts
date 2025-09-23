@@ -1,6 +1,5 @@
 #!/bin/bash
 
-# List of server IPs new
 servers=(
 149.28.173.88
 45.32.244.174
@@ -73,15 +72,13 @@ servers=(
 45.63.28.115
 )
 
-# Loop through servers
 for server in "${servers[@]}"; do
     echo "========================================"
     echo "➡️ Connecting to server: $server"
 
-    # Run ls /home/ via cng
-    output=$(cng server "$server" "ls /home/")
+    # Run ls /home/ inside interactive shell to ensure cng alias loads
+    output=$(bash -i -c "cng server $server 'ls /home/'")
 
-    # Extract numeric server ID before .cloudwaysapps.com
     server_id=$(echo "$output" | grep -oE '^[0-9]+')
 
     echo "📌 Server IP: $server"
