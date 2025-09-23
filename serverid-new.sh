@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # List of server IPs
-SERVERS=(
+servers=(
 149.28.173.88
 45.32.244.174
 45.77.123.146
@@ -73,22 +73,20 @@ SERVERS=(
 45.63.28.115
 )
 
-echo "========== Server ID Report =========="
+# Loop through servers
+for server in "${servers[@]}"; do
+    echo "========================================"
+    echo "➡️ Connecting to server: $server"
 
-for SERVER in "${SERVERS[@]}"; do
-    echo "🔗 Connecting to $SERVER ..."
+    # Run ls /home/ via cng
+    output=$(cng server "$server" "ls /home/")
 
-    # Run ls /home/ on the server using cng
-    SERVER_ID=$(cng "$SERVER" "ls /home/ 2>/dev/null | grep -o '^[0-9]*' | head -n 1")
+    # Extract numeric server ID before .cloudwaysapps.com
+    server_id=$(echo "$output" | grep -oE '^[0-9]+')
 
-    if [ -n "$SERVER_ID" ]; then
-        echo "✅ Server IP: $SERVER | Server ID: $SERVER_ID"
-    else
-        echo "❌ Server IP: $SERVER | Could not fetch Server ID"
-    fi
-
-    echo "🔌 Disconnected from $SERVER"
-    echo "--------------------------------------"
+    echo "📌 Server IP: $server"
+    echo "🆔 Server ID: $server_id"
+    echo "⬅️ Disconnecting from $server"
+    echo "========================================"
+    echo ""
 done
-
-echo "========== End of Report =========="
