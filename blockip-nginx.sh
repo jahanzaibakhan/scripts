@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # block-ip.sh
-# This script blocks an IP in Nginx and restarts the service.
+# Usage: curl -s https://raw.githubusercontent.com/jahanzaibakhan/scripts/main/blockip-nginx.sh | bash -s 192.168.1.100
 
 CONF_FILE="/etc/nginx/additional_server_conf"
 
@@ -8,13 +8,14 @@ echo "===================================="
 echo " 🚫 Nginx IP Blocker Script"
 echo "===================================="
 
-# Step 1: Ask for IP
-read -rp "👉 Enter the IP address you want to block: " BLOCK_IP
-
-if [[ -z "$BLOCK_IP" ]]; then
-    echo "❌ No IP provided. Exiting."
+# Step 1: Get IP from argument
+if [[ -z "$1" ]]; then
+    echo "❌ No IP provided."
+    echo "👉 Usage: bash $0 <IP_ADDRESS>"
     exit 1
 fi
+
+BLOCK_IP="$1"
 
 # Step 2: Append to Nginx conf
 echo "📝 Blocking IP $BLOCK_IP in $CONF_FILE..."
