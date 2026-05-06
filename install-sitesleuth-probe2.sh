@@ -8,6 +8,9 @@
 # Options:
 #   --dry-run          Print actions only; do not write files
 #   --secret=VALUE     Use this secret (min 16 chars); default: random hex from openssl
+#   --domain=BASE      HTTPS base URL for this WordPress folder (printed in summary); e.g. https://www.example.com or https://example.com/subdir (no trailing slash required)
+#   -d BASE            Same as --domain=
+#   --non-interactive, -y  Do not prompt for domain (shows YOUR-DOMAIN unless --domain is set)
 #   --force            Overwrite sitesleuth-probe.php if it already exists
 #   -h, --help         Show this help
 #
@@ -17,12 +20,14 @@ set -euo pipefail
 
 DRY_RUN=0
 FORCE_PHP=0
+NON_INTERACTIVE=0
 CUSTOM_SECRET=""
+DOMAIN_FLAG=""
 ROOT=""
 PROBE_FILE="sitesleuth-probe.php"
 
 usage() {
-  sed -n '1,20p' "$0" | tail -n +2
+  sed -n '2,17p' "$0"
   exit 0
 }
 
@@ -30,8 +35,18 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     --force) FORCE_PHP=1 ;;
+    --non-interactive|-y) NON_INTERACTIVE=1 ;;
     --secret=*)
       CUSTOM_SECRET="${1#*=}"
+      ;;
+    --domain=*)
+      DOMAIN_FLAG="${1#*=}"
+      ;;
+    --domain|-d)
+      if [[ $# -lt 2 ]]; then echo "Error: $1 requires a value (HTTPS base URL)" >&2; exit 1; fi
+      DOMAIN_FLAG="$2"
+      shift 2
+      continue
       ;;
     -h|--help) usage ;;
     -*)
@@ -267,6 +282,43 @@ echo json_encode($out);
 PROBE_PHP_EOF
 }
 
+build_probe_url_from_base() {
+  local s="${1:-}"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  [[ -z "$s" ]] && echo "" && return
+  [[ ! "$s" =~ ^https?:// ]] && s="https://${s}"
+  while [[ "$s" == */ ]]; do s="${s%/}"; done
+  printf '%s/%s\n' "$s" "$PROBE_FILE"
+}
+
+prompt_or_resolve_probe_url() {
+  if [[ -n "$DOMAIN_FLAG" ]]; then
+    build_probe_url_from_base "$DOMAIN_FLAG"
+    return
+  fi
+  if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
+    echo ""
+    return
+  fi
+
+  echo "" >&2
+  echo "HTTPS base URL for this WordPress folder (shown in probe URL below; no trailing slash)." >&2
+  echo "Examples: https://www.example.com — or https://www.example.com/shop — or just: example.com" >&2
+  echo "Leave empty if you prefer to substitute the hostname yourself." >&2
+
+  local raw=""
+  if [[ -r /dev/tty ]]; then
+    read -r -p "Probe base URL: " raw </dev/tty || raw=""
+    raw="${raw#"${raw%%[![:space:]]*}"}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+  else
+    echo "No readable /dev/tty (often when stdin is piped). Use --domain=https://..., or rerun on a SSH session." >&2
+    echo "(Tip: bash -lc \"curl -fsSL … | bash -s -- --domain=https://example.com\")" >&2
+  fi
+  build_probe_url_from_base "$raw"
+}
+
 insert_wp_config_block() {
   local tmp snippet line
   snippet=$(mktemp)
@@ -355,11 +407,20 @@ if [[ "$NEED_WP_PATCH" -eq 1 ]]; then
   insert_wp_config_block
 fi
 
+PROBE_FULL_URL="$(prompt_or_resolve_probe_url)"
+if [[ -z "$PROBE_FULL_URL" ]]; then
+  URL_LINE="https://YOUR-DOMAIN/${PROBE_FILE}"
+  CURL_SAMPLE="curl -sS -o /dev/null -w '%{http_code}\\n' -X POST \"${URL_LINE}\""
+else
+  URL_LINE="$PROBE_FULL_URL"
+  CURL_SAMPLE="curl -sS -o /dev/null -w '%{http_code}\\n' -X POST \"${URL_LINE}\""
+fi
+
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "Done. Add this to your SiteSleuth case (Server probe):"
 echo ""
-echo "  Probe URL:  https://YOUR-DOMAIN/${PROBE_FILE}"
+echo "  Probe URL:  ${URL_LINE}"
 if [[ -n "$SECRET" ]]; then
   echo "  Secret:     ${SECRET}"
 else
@@ -367,7 +428,7 @@ else
 fi
 echo ""
 echo "Quick check (expects HTTP 401 without header — proves file is reachable):"
-echo "  curl -sS -o /dev/null -w '%{http_code}\\n' -X POST \"https://YOUR-DOMAIN/${PROBE_FILE}\""
+echo "  ${CURL_SAMPLE}"
 echo ""
 echo "Remove ${PROBE_FILE} and the wp-config block when the audit is finished."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
