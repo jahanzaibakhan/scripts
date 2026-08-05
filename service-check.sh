@@ -44,6 +44,40 @@ declare -a CHECK_NAMES=()
 declare -a CHECK_STATUS=()
 declare -a CHECK_DETAIL=()
 
+DPKG_LOCK_WAIT_SECS=60   # how long to wait for a busy dpkg/apt lock before giving up
+
+# Returns 0 (locked) with holder info on stdout, or 1 (free) with nothing.
+dpkg_lock_holder() {
+  local holder=""
+  holder="$(sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock 2>/dev/null | awk '{print $NF}' | head -1)"
+  if [ -z "$holder" ]; then
+    return 1
+  fi
+  local pid="${holder//[!0-9]/}"
+  local cmd=""
+  if [ -n "$pid" ]; then
+    cmd="$(ps -o cmd= -p "$pid" 2>/dev/null)"
+  fi
+  echo "PID ${pid} (${cmd:-unknown process})"
+  return 0
+}
+
+# Waits up to DPKG_LOCK_WAIT_SECS for the dpkg lock to free.
+# Echoes final holder info (empty if it freed up) and returns 0 if free, 1 if still busy.
+wait_for_dpkg_unlock() {
+  local waited=0 holder=""
+  while [ "$waited" -lt "$DPKG_LOCK_WAIT_SECS" ]; do
+    holder="$(dpkg_lock_holder)"
+    if [ -z "$holder" ]; then
+      return 0
+    fi
+    sleep 3
+    waited=$((waited+3))
+  done
+  echo "$holder"
+  return 1
+}
+
 run_check() {
   local name="$1" cmd="$2"
   local out status_word color
@@ -57,6 +91,52 @@ run_check() {
   else
     status_word="FAIL"; color="$RED"
   fi
+  CHECK_NAMES+=("$name")
+  CHECK_STATUS+=("$status_word")
+  CHECK_DETAIL+=("$out")
+
+  echo -e "${BOLD}== ${name} ==${NC}"
+  echo -e "${color}[${status_word}]${NC}"
+  echo "$out" | sed 's/^/  /'
+  echo ""
+}
+
+# Like run_check, but for dpkg/apt commands that fail purely because the
+# lock is held by an in-progress upgrade. Waits briefly, and if the lock is
+# still busy after the wait, reports BUSY (yellow) instead of FAIL, naming
+# the process/package holding it — so an active upgrade isn't mistaken for
+# a broken package.
+run_apt_check() {
+  local name="$1" cmd="$2"
+  local holder out status_word color
+
+  holder="$(dpkg_lock_holder || true)"
+  if [ -n "$holder" ]; then
+    echo -e "${YELLOW}dpkg/apt lock currently held by ${holder} — waiting up to ${DPKG_LOCK_WAIT_SECS}s...${NC}"
+    if wait_for_dpkg_unlock >/tmp/.dpkg_wait_result 2>&1; then
+      holder=""
+    else
+      holder="$(cat /tmp/.dpkg_wait_result)"
+      rm -f /tmp/.dpkg_wait_result
+    fi
+  fi
+
+  if [ -n "$holder" ]; then
+    status_word="BUSY"; color="$YELLOW"
+    out="An update/upgrade is currently running and holds the dpkg lock: ${holder}. This check was skipped — it is NOT a broken-package failure, just an in-progress deployment. Re-run once the upgrade finishes."
+  else
+    out="$(eval "$cmd" 2>&1)"
+    local rc=$?
+    if [ $rc -eq 0 ] && [ -n "$out" ]; then
+      status_word="PASS"; color="$GREEN"
+    elif [ $rc -eq 0 ] && [ -z "$out" ]; then
+      status_word="PASS"; color="$GREEN"
+      out="(no output — clean)"
+    else
+      status_word="FAIL"; color="$RED"
+    fi
+  fi
+
   CHECK_NAMES+=("$name")
   CHECK_STATUS+=("$status_word")
   CHECK_DETAIL+=("$out")
@@ -86,9 +166,9 @@ run_check "memory (free -h)" "free -h"
 run_check "OOM kill signatures (dmesg)" "dmesg -T 2>/dev/null | grep -iE 'oom|killed process' | tail -50 || true"
 
 # ---------- 5. dpkg / apt package state ----------
-run_check "dpkg audit (broken packages)" "dpkg --audit"
-run_check "apt-get check (dependency issues)" "apt-get check"
-run_check "package version/status" "dpkg -s '$SERVICE' 2>/dev/null | grep -E 'Status|Version' || dpkg -l | grep -i '$SERVICE'"
+run_apt_check "dpkg audit (broken packages)" "dpkg --audit"
+run_apt_check "apt-get check (dependency issues)" "apt-get check"
+run_apt_check "package version/status" "dpkg -s '$SERVICE' 2>/dev/null | grep -E 'Status|Version' || dpkg -l | grep -i '$SERVICE'"
 
 # ---------- 6. recent apt upgrade history for this package ----------
 run_check "apt history for package" "grep -i '$SERVICE' /var/log/apt/history.log | tail -20"
@@ -124,19 +204,29 @@ echo "-----------------------------------------------------"
 echo -e "${BOLD}Summary${NC}"
 
 FAIL_COUNT=0
+BUSY_COUNT=0
 for i in "${!CHECK_NAMES[@]}"; do
-  if [ "${CHECK_STATUS[$i]}" = "FAIL" ]; then
-    echo -e "  ${RED}[FAIL]${NC} ${CHECK_NAMES[$i]}"
-    FAIL_COUNT=$((FAIL_COUNT+1))
-  else
-    echo -e "  ${GREEN}[PASS]${NC} ${CHECK_NAMES[$i]}"
-  fi
+  case "${CHECK_STATUS[$i]}" in
+    FAIL)
+      echo -e "  ${RED}[FAIL]${NC} ${CHECK_NAMES[$i]}"
+      FAIL_COUNT=$((FAIL_COUNT+1))
+      ;;
+    BUSY)
+      echo -e "  ${YELLOW}[BUSY]${NC} ${CHECK_NAMES[$i]} (upgrade in progress)"
+      BUSY_COUNT=$((BUSY_COUNT+1))
+      ;;
+    *)
+      echo -e "  ${GREEN}[PASS]${NC} ${CHECK_NAMES[$i]}"
+      ;;
+  esac
 done
 
-if [ "$FAIL_COUNT" -eq 0 ]; then
+if [ "$FAIL_COUNT" -eq 0 ] && [ "$BUSY_COUNT" -eq 0 ]; then
   echo -e "\n${GREEN}${BOLD}Overall: HEALTHY — no broken/failed checks detected.${NC}"
+elif [ "$FAIL_COUNT" -eq 0 ]; then
+  echo -e "\n${YELLOW}${BOLD}Overall: HEALTHY, but ${BUSY_COUNT} check(s) skipped — an update/upgrade is currently running (dpkg lock busy). Re-run once it finishes for a full result.${NC}"
 else
-  echo -e "\n${RED}${BOLD}Overall: ${FAIL_COUNT} check(s) FAILED — review above for root cause.${NC}"
+  echo -e "\n${RED}${BOLD}Overall: ${FAIL_COUNT} check(s) FAILED (plus ${BUSY_COUNT} skipped due to an in-progress upgrade) — review above for root cause.${NC}"
 fi
 
 # ---------- write TXT report ----------
@@ -154,6 +244,7 @@ fi
   echo ""
   echo "======================================================="
   echo "Total failed checks: ${FAIL_COUNT}"
+  echo "Total busy/skipped checks (upgrade in progress): ${BUSY_COUNT}"
 } > "$TXT_FILE" 2>/dev/null
 
 # ---------- write JSON report ----------
@@ -167,6 +258,7 @@ json_escape() {
   echo "  \"service\": \"${SERVICE}\","
   echo "  \"timestamp\": \"${TS}\","
   echo "  \"failed_count\": ${FAIL_COUNT},"
+  echo "  \"busy_count\": ${BUSY_COUNT},"
   echo "  \"checks\": ["
   for i in "${!CHECK_NAMES[@]}"; do
     name_json=$(json_escape "${CHECK_NAMES[$i]}")
