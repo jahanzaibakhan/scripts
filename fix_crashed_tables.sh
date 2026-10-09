@@ -29,9 +29,9 @@ ok "Connected. Data directory: $DATADIR"
 
 # ---------------------------------------------------------------- Step 2
 step "2/6" "Input"
-read -rp "    Database name: " DB
+read -rp "    Database name: " DB </dev/tty
 [[ "$DB" =~ ^[A-Za-z0-9_]+$ ]] || { err "Invalid database name."; exit 1; }
-read -rp "    Corrupt table name(s) (space or comma separated): " TABLE_INPUT
+read -rp "    Corrupt table name(s) (space or comma separated): " TABLE_INPUT </dev/tty
 TABLES=(${TABLE_INPUT//,/ })
 [ ${#TABLES[@]} -gt 0 ] || { err "No table given."; exit 1; }
 for t in "${TABLES[@]}"; do
