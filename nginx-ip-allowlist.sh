@@ -54,8 +54,8 @@ RULES="$(printf '%s\n' "${ALLOW_IPS[@]}")"
 TMP="$(mktemp)"
 RULES="$RULES" awk '
   { print }
-  /^[[:space:]]*server_name[[:space:]]/ {
-    match($0, /^[[:space:]]*/); ind = substr($0, 1, RLENGTH)
+  /^[ \t]*server_name[ \t;]/ {
+    match($0, /^[ \t]*/); ind = substr($0, 1, RLENGTH)
     n = split(ENVIRON["RULES"], ips, "\n")
     for (i = 1; i <= n; i++) if (ips[i] != "") print ind "allow " ips[i] ";"
     print ind "deny all;"
@@ -65,7 +65,7 @@ RULES="$RULES" awk '
 ' "$CONF" >"$TMP"
 rc=$?
 if [[ $rc -ne 0 ]]; then
-  rm -f "$TMP"
+  rm -f "$TMP" "$BACKUP"
   die "No server_name line found in $CONF; nothing changed."
 fi
 cat "$TMP" >"$CONF" && rm -f "$TMP"
