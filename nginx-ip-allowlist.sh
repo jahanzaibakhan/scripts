@@ -48,14 +48,15 @@ BACKUP="$CONF.bak.$(date +%Y%m%d%H%M%S)"
 cp -p "$CONF" "$BACKUP" || die "Backup failed."
 echo "Backup: $BACKUP"
 
-# Insert the rules after every server_name line (i.e. in each server block),
-# reusing that line's indentation.
+# Insert the rules at the top of every server block (right after "server {").
+# Cloudways keeps server_name in an included conf/server.nginx, so anchor on
+# the block opener rather than server_name.
 RULES="$(printf '%s\n' "${ALLOW_IPS[@]}")"
 TMP="$(mktemp)"
 RULES="$RULES" awk '
   { print }
-  /^[ \t]*server_name[ \t;]/ {
-    match($0, /^[ \t]*/); ind = substr($0, 1, RLENGTH)
+  /^[ \t]*server[ \t]*\{/ {
+    match($0, /^[ \t]*/); ind = substr($0, 1, RLENGTH) "        "
     n = split(ENVIRON["RULES"], ips, "\n")
     for (i = 1; i <= n; i++) if (ips[i] != "") print ind "allow " ips[i] ";"
     print ind "deny all;"
@@ -66,7 +67,7 @@ RULES="$RULES" awk '
 rc=$?
 if [[ $rc -ne 0 ]]; then
   rm -f "$TMP" "$BACKUP"
-  die "No server_name line found in $CONF; nothing changed."
+  die "No server { block found in $CONF; nothing changed."
 fi
 cat "$TMP" >"$CONF" && rm -f "$TMP"
 
