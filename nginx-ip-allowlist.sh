@@ -14,6 +14,7 @@
 set -uo pipefail
 
 ENABLED_DIR="/etc/nginx/sites-enabled"
+BACKUP_DIR="/var/cw/systeam"
 ALLOW_IPS=(
   "143.198.206.48"
   "134.209.241.49"
@@ -64,7 +65,8 @@ if [[ $ACTION == remove ]] && ! has_rule; then
   exit 0
 fi
 
-BACKUP="$CONF.bak.$(date +%Y%m%d%H%M%S)"
+[[ -d "$BACKUP_DIR" ]] || die "Backup directory $BACKUP_DIR does not exist."
+BACKUP="$BACKUP_DIR/$APP.nginx.bak.$(date +%Y%m%d%H%M%S)"
 cp -p "$CONF" "$BACKUP" || die "Backup failed."
 echo "Backup: $BACKUP"
 
@@ -140,11 +142,12 @@ fi
 
 systemctl reload nginx || { rollback; nginx -t && systemctl reload nginx; die "Reload failed; original config restored."; }
 
-# Verify against the file and the config nginx actually loaded (nginx -T
-# prints each file under a "# configuration file <path>:" header).
+# Verify against the file and the config nginx actually loaded. nginx -T
+# prints each file under a "# configuration file <path>:" header, using the
+# path it was included by (the sites-enabled symlink), so accept either path.
 loaded_conf() {
-  nginx -T 2>/dev/null | awk -v f="# configuration file $CONF:" '
-    /^# configuration file / { on = ($0 == f); next } on'
+  nginx -T 2>/dev/null | awk -v a="# configuration file $LINK:" -v b="# configuration file $CONF:" '
+    /^# configuration file / { on = ($0 == a || $0 == b); next } on'
 }
 LOADED="$(loaded_conf)"
 
