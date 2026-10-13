@@ -7,9 +7,9 @@
 # EC key. Apache's adminer vhost (:8082) fails with AH02565 and the whole
 # apache2 service exits.
 #
-# Fix: restore adminer.pem_bak (the EC cert that matches adminer.key),
-# keeping the broken cert as adminer.pem.broken-<timestamp>, then start
-# or reload apache2.
+# Fix: restore a valid cert that matches adminer.key (normally
+# adminer.pem_bak; see the search below), keeping the broken cert as
+# adminer.pem.broken-<timestamp>, then start or reload apache2.
 #
 # Usage (as root):
 #   bash adminer-cert-mismatch-fix.sh            # check, confirm, fix
@@ -22,6 +22,7 @@ DIR="/etc/ssl/adminer"
 PEM="$DIR/adminer.pem"
 KEY="$DIR/adminer.key"
 PEM_BAK="$DIR/adminer.pem_bak"
+DEFAULT_CRT="/var/cw/systeam/upgrade/debian_upgrade_configs/default_certs/server.crt"
 FACT="/etc/ansible/facts.d/playbook_version.fact"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -67,15 +68,29 @@ if [[ "$PEM_FP" == "$KEY_FP" ]]; then
 fi
 
 echo "RESULT: KEY MISMATCH - adminer.pem does not match adminer.key."
+echo
 
-# Verify the known fix applies: the backup cert must match the current key.
-[[ -f "$PEM_BAK" ]] || die "$PEM_BAK not found - cannot apply the standard fix. Escalate."
-BAK_FP="$(cert_fp "$PEM_BAK")"
-echo "adminer.pem_bak  : $BAK_FP  ($(cert_info "$PEM_BAK"))"
-if [[ "$BAK_FP" != "$KEY_FP" ]]; then
-  die "adminer.pem_bak does not match adminer.key either - this is a different issue. No changes made. Escalate."
-fi
-echo "VERIFIED: adminer.pem_bak matches adminer.key - the standard fix applies."
+# Find a replacement cert that matches the current key and is not expired.
+# adminer.pem_bak is normally it, but if the playbook's cert step ran twice
+# pem_bak holds an RSA cert too; the Debian upgrade leaves a copy of the
+# EC cert under default_certs on some servers.
+echo "Looking for a valid cert matching adminer.key:"
+SRC=""
+for c in "$PEM_BAK" "$DIR"/adminer.pem.*~ "$DEFAULT_CRT"; do
+  [[ -f "$c" ]] || continue
+  fp="$(cert_fp "$c")"
+  if [[ "$fp" != "$KEY_FP" ]]; then
+    echo "  no   $c  ($fp)"
+  elif ! openssl x509 -in "$c" -noout -checkend 0 >/dev/null 2>&1; then
+    echo "  no   $c  (matches key but expired)"
+  else
+    echo "  YES  $c  ($(cert_info "$c"))"
+    SRC="$c"
+    break
+  fi
+done
+[[ -n "$SRC" ]] || die "No valid cert matching adminer.key found - this needs a new cert from the platform team. No changes made. Escalate."
+echo "VERIFIED: $SRC matches adminer.key - the fix applies."
 echo
 
 if [[ $MODE == check ]]; then
@@ -85,7 +100,7 @@ fi
 
 echo "The fix will:"
 echo "  1. copy $PEM -> $PEM.broken-<timestamp>"
-echo "  2. copy $PEM_BAK -> $PEM"
+echo "  2. copy $SRC -> $PEM"
 echo "  3. test the Apache config, then start/reload apache2"
 read -r -p "Apply the fix? [y/N]: " OK </dev/tty
 [[ "$OK" =~ ^[Yy]$ ]] || die "Aborted. No changes made."
@@ -95,7 +110,7 @@ BROKEN="$PEM.broken-$(date +%Y%m%d%H%M%S)"
 cp -a "$PEM" "$BROKEN" || die "Backup of $PEM failed. No changes made."
 echo "Backup: $BROKEN"
 
-cp -a "$PEM_BAK" "$PEM" || die "Restore failed. Original is still at $BROKEN."
+cp "$SRC" "$PEM" && chown root:root "$PEM" && chmod 600 "$PEM" || die "Restore failed. Original is still at $BROKEN."
 
 if [[ "$(cert_fp "$PEM")" != "$KEY_FP" ]]; then
   cp -a "$BROKEN" "$PEM"
