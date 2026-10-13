@@ -73,10 +73,11 @@ echo
 # Find a replacement cert that matches the current key and is not expired.
 # adminer.pem_bak is normally it, but if the playbook's cert step ran twice
 # pem_bak holds an RSA cert too; the Debian upgrade leaves a copy of the
-# EC cert under default_certs on some servers.
+# EC cert under default_certs on some servers, and apps on the default
+# *.cloudwaysapps.com SSL keep one in /home/<server>/<app>/ssl/.
 echo "Looking for a valid cert matching adminer.key:"
 SRC=""
-for c in "$PEM_BAK" "$DIR"/adminer.pem.*~ "$DEFAULT_CRT"; do
+for c in "$PEM_BAK" "$DIR"/adminer.pem.*~ "$DEFAULT_CRT" /home/*/*/ssl/server.crt; do
   [[ -f "$c" ]] || continue
   fp="$(cert_fp "$c")"
   if [[ "$fp" != "$KEY_FP" ]]; then
