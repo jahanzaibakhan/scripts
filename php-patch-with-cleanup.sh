@@ -512,13 +512,19 @@ verify_patch() {
 }
 
 # PIDs of a patching_php.sh run in progress (holder of its lock), if any.
+# Only "bash [path/]patching_php.sh": under bash -c "$(curl ...)" this script's
+# own text (which mentions patching_php.sh) is on the command line of this shell
+# and of every subshell, so a looser pattern would find itself.
 running_patch_pids() {
-    local pids
-    pids=$(pgrep -f '^(/usr)?(/bin/)?bash .*patching_php\.sh' | grep -vx "$$")
+    local pids pid alive=""
+    pids=$(pgrep -f '^(/usr)?(/bin/)?bash +([^ ]*/)?patching_php\.sh( |$)')
     if [[ -z "$pids" && -e "$PATCH_LOCK" ]] && ! flock -n "$PATCH_LOCK" true 2>/dev/null; then
         pids=$(fuser "$PATCH_LOCK" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$')
     fi
-    echo $pids
+    for pid in $pids; do
+        [[ "$pid" != "$$" && "$pid" != "$BASHPID" ]] && kill -0 "$pid" 2>/dev/null && alive+="$pid "
+    done
+    echo $alive
 }
 
 show_running_patch() {
