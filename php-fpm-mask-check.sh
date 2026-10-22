@@ -84,7 +84,7 @@ remote_check() {
   fi
 
   j=$(journalctl --since "$since" --no-pager -o short-iso 2>/dev/null \
-      | grep -E 'php[0-9]+\.[0-9]+-fpm|php-fpm[0-9]|patching_php|multi_php_migrate_hosts|reinstall newrelic')
+      | grep -E 'php[0-9]+\.[0-9]+-fpm|php-fpm[0-9]|patching_php|multi_php_migrate_hosts|reinstall newrelic|fpm/pool\.d/')
 
   for d in /etc/php/*/fpm; do
     [ -d "$d" ] || continue
@@ -153,7 +153,7 @@ remote_check() {
     sock=$(grep -m1 -oE '/var/run/fpm-[A-Za-z0-9_.-]+\.sock' "$f")
     [ -n "$sock" ] && [ ! -S "$sock" ] || continue
     pv=$(grep -h "^$app=" "$fact_dir/applications.fact" 2>/dev/null | cut -d= -f2)
-    perr=$(grep -h "${sock##*/} failed" /home/*/"$app"/logs/nginx-app.error.log 2>/dev/null | head -1 | cut -c1-19)
+    perr=$(grep -h "${sock##*/} failed" /home/*/"$app"/logs/*error*.log /var/log/nginx/error.log 2>/dev/null | cut -c1-19 | sort | head -1)
     pdel=$(printf '%s\n' "$j" | grep -E "path=/etc/php/[0-9.]+/fpm/pool.d/$app-[0-9]+\.conf state=absent" | tail -1 | ts)
     echo "A|$app|$sock|${pv:-?}|$perr|$pdel"
   done
@@ -294,8 +294,9 @@ for ip in "${IPS[@]}"; do
   while IFS='|' read -r _ msg; do DETAILS+="  Upgrade    : $msg"$'\n'; done < <(grep '^U|' "$out")
   while IFS='|' read -r _ msg; do DETAILS+="  Monit      : $msg"$'\n'; done < <(grep '^M|' "$out")
   while IFS='|' read -r _ msg; do DETAILS+="  ${R}Error${N}      : $msg"$'\n'; done < <(grep '^E|' "$out")
-  case "$worst" in
-    masked|down)
+  case "$worst/$wcause" in
+    */APP_POOL_MISSING) ;;
+    masked/*|down/*)
       DETAILS+="  ${B}Fix${N}        : systemctl unmask php$wver-fpm && systemctl enable --now php$wver-fpm && monit monitor fpm${wver//./}"$'\n' ;;
   esac
   if grep -q '^V|[^|]*|unused|.*|warn|ENABLED_NO_POOLS' "$out"; then
