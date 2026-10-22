@@ -13,7 +13,7 @@
 #
 #  1. Clearing disk space  runs opsgenie/disk-cleanup.sh. If no space is
 #                          freed, warns "Nothing to clear" and still patches,
-#                          unless less than 500 MiB is available on /.
+#                          unless less than 1.2 GiB is free on / (df "Avail").
 #  2. Sury signing key     replaces expired copies of the DEB.SURY.ORG key
 #                          (php, apache2, nginx repos) with the renewed key from
 #                          packages.sury.org, or apt-get update fails EXPKEYSIG.
@@ -71,7 +71,7 @@ uCZfZzgLnNAwDgYDVR0PAQH/BAQDAgGGMAoGCCqGSM49BAMDA2gAMGUCMFXjIlbp
 b0Igj762TVntd00pxCAgRWSGOlDGxK0tk/UYfXLtqc/ErFc2KAhl3zx5Zn6g6g==
 -----END CERTIFICATE-----"
 MIN_FREED_BYTES=$((1024 * 1024))          # under 1 MiB freed counts as nothing cleared
-MIN_FREE_BYTES=$((500 * 1024 * 1024))     # apt needs room to unpack the packages
+MIN_FREE_BYTES=1288490188                 # 1.2 GiB df "Avail" needed after cleanup
 SURY_KEY_URL="https://packages.sury.org/php/apt.gpg"
 SURY_FPR="15058500A0235D97F5D10063B188E2B695BD4743"
 
@@ -89,8 +89,8 @@ fail()   { printf '%s[ERROR] %s%s\n' "$C_RED" "$1" "$C_RESET" >&2; }
 
 human_size() { numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || echo "$1 bytes"; }
 
-# Size - Used: all unallocated blocks on /, root reservation included.
-physical_free_bytes() { df -PB1 / 2>/dev/null | awk 'NR == 2 { print $2 - $3 }'; }
+# df's "Avail" for / (what df -h shows; excludes blocks reserved for root).
+free_bytes() { df -PB1 / 2>/dev/null | awk 'NR == 2 { print $4 }'; }
 
 # patching_php.sh exactly as provided; it logs to /var/log/patching_php.log.
 write_patch_script() {
@@ -331,7 +331,7 @@ chmod 700 "$PATCH_SCRIPT"
 clear_disk_space() {
     local before after freed
     status "[1/4] Clearing disk space..."
-    before=$(physical_free_bytes)
+    before=$(free_bytes)
     echo "Free space on / before: $(human_size "$before")"
 
     if ! curl -fsSL "$CLEANUP_URL" | bash > "$CLEANUP_LOG" 2>&1; then
@@ -340,7 +340,7 @@ clear_disk_space() {
         exit 1
     fi
 
-    after=$(physical_free_bytes)
+    after=$(free_bytes)
     freed=$((after - before))
     echo "Free space on / after:  $(human_size "$after")"
 
@@ -438,13 +438,12 @@ refresh_sury_key() {
     fi
 }
 
-# apt runs as root, which may also use the blocks ext4 reserves for root, so
-# count those too (df's Avail column leaves them out).
+# Uses df "Avail", the free space df -h shows, not the root-reserved blocks.
 check_disk_space() {
     local free
-    free=$(physical_free_bytes)
+    free=$(free_bytes)
     if (( free < MIN_FREE_BYTES )); then
-        fail "Not enough disk space: only $(human_size "$free") free on / after cleanup, apt needs at least $(human_size "$MIN_FREE_BYTES"). Patching not started - free up space and rerun."
+        fail "Not enough disk space: only $(human_size "$free") free on / after cleanup (df Avail), need at least $(human_size "$MIN_FREE_BYTES"). Patching not started - free up space and rerun."
         write_result FAILED "low_disk free=$(human_size "$free")"
         exit 1
     fi
