@@ -23,6 +23,7 @@ Options:
 
 | Option | Meaning |
 |---|---|
+| `-l` | Check this server instead of remote IPs (run as root) |
 | `-f FILE` | Read IPs from FILE |
 | `-u USER` | SSH user (default `systeam`; needs passwordless sudo on the target) |
 | `-j N` | Servers checked in parallel (default 8) |
@@ -63,5 +64,7 @@ For each affected version the details show:
 - when the mask symlink was created;
 - the first and last monit `is masked` errors;
 - any manual `systemctl unmask`.
+
+Mask evidence comes from every run in `patching_php.log`, not only the latest, because a later re-run of the patch would otherwise hide it. If the journal has rotated, the outage window is taken from `monit.log`; that is shown in the details only and does not change the result.
 
 They also show the patch run summary (start time, `multi_php`, versions running before, apt result, rc), the facts, and monit.

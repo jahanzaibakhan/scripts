@@ -22,8 +22,10 @@
 #   bash php-fpm-mask-check.sh [options] IP [IP...]
 #   bash php-fpm-mask-check.sh -f ips.txt
 #   curl -fsSL <raw-url> | bash -s -- [options] IP [IP...]
+#   curl -fsSL <raw-url> | sudo bash -s -- -l     # on the server itself
 #
 # Options:
+#   -l        check this server (run as root), no SSH
 #   -f FILE   read IPs from FILE (one per line, # comments allowed)
 #   -u USER   SSH user (default: systeam)
 #   -j N      servers checked in parallel (default: 8)
@@ -50,7 +52,7 @@ set -uo pipefail
 remote_check() {
   local since="$1"
   local fact_dir=/etc/ansible/facts.d plog=/var/log/patching_php.log
-  local j run ver d role apps en ac link patch_mask mig ans ferr lerr unmask status cause
+  local j run ver d role apps en ac link patch_mask pm_multi mig ans ferr lerr unmask status cause mon mon_only
   local mafact phpfact appv p_start p_multi p_before p_apt p_rc
 
   ts() { cut -c1-19 | tr 'T' ' '; }
@@ -97,12 +99,27 @@ remote_check() {
     link=""
     [ "$(readlink "/etc/systemd/system/php$ver-fpm.service" 2>/dev/null)" = /dev/null ] && \
       link=$(stat -c '%y' "/etc/systemd/system/php$ver-fpm.service" 2>/dev/null | cut -c1-19)
-    patch_mask=$(printf '%s' "${run:-}" | grep "Stopped and masked php$ver-fpm.service" | tail -1 | cut -c1-19)
+    # Any patch run (not just the last) that masked this version, and that run's multi_php.
+    IFS='|' read -r patch_mask pm_multi < <(awk -v u="Stopped and masked php$ver-fpm.service" '
+      /patching_php.sh started/ {m = ""}
+      match($0, /multi_php=[a-z]+/) {m = substr($0, RSTART + 10, RLENGTH - 10)}
+      index($0, u) {t = substr($0, 1, 19); mm = m}
+      END {print t "|" mm}' "$plog" 2>/dev/null)
     mig=$(printf '%s\n' "$j" | grep -E "name=php$ver-fpm masked=False" | tail -1 | ts)
     ans=$(printf '%s\n' "$j" | grep -E "_raw_params=systemctl mask php$ver-fpm |name=php$ver-fpm masked=True" | tail -1 | ts)
     ferr=$(printf '%s\n' "$j" | grep "Unit php$ver-fpm.service is masked" | head -1 | ts)
     lerr=$(printf '%s\n' "$j" | grep "Unit php$ver-fpm.service is masked" | tail -1 | ts)
     unmask=$(printf '%s\n' "$j" | grep -E "COMMAND=.*systemctl unmask php$ver-fpm" | tail -1 | ts)
+    # Journal may be rotated; monit.log keeps the outage window (shown, not used for status).
+    if [ -z "$ferr" ]; then
+      mon="fpm${ver//./}"; [ "$role" = single ] && mon=fpm
+      ferr=$(zcat -f /var/log/monit.log.1 /var/log/monit.log 2>/dev/null | grep "'$mon' process is not running" | head -1 | cut -c2-20 | tr 'T' ' ')
+      lerr=$(zcat -f /var/log/monit.log.1 /var/log/monit.log 2>/dev/null | grep "'$mon' process is not running" | tail -1 | cut -c2-20 | tr 'T' ' ')
+      [ -n "$ferr" ] && ferr="monit:$ferr"
+      mon_only=1
+    else
+      mon_only=0
+    fi
 
     status=ok; cause=-
     if [ "$role" = unused ]; then
@@ -111,9 +128,9 @@ remote_check() {
     else
       if [ "$en" = masked ]; then status=masked
       elif [ "$ac" != active ]; then status=down
-      elif [ -n "$patch_mask" ] || [ -n "$ans" ] || [ -n "$ferr" ]; then status=recovered; fi
+      elif [ -n "$patch_mask" ] || [ -n "$ans" ] || { [ -n "$ferr" ] && [ "$mon_only" = 0 ]; }; then status=recovered; fi
       if [ "$status" != ok ]; then
-        if [ -n "$patch_mask" ] && { [ "${p_multi:-}" = false ] && [ "${mafact:-}" = yes ] || [[ -n "$mig" && "$mig" < "$patch_mask" ]]; }; then
+        if [ -n "$patch_mask" ] && { [ "${pm_multi:-}" = false ] && [ "${mafact:-}" = yes ] || [[ -n "$mig" && "$mig" < "$patch_mask" ]]; }; then
           cause=PATCH_RACE
         elif [ -n "$ans" ]; then cause=UPGRADE
         elif [ -n "$patch_mask" ]; then cause=PATCH
@@ -136,10 +153,11 @@ remote_check() {
 die() { echo "ERROR: $*" >&2; exit 2; }
 usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}" 2>/dev/null; }
 
-USER_SSH=systeam; JOBS=8; SINCE="7 days ago"; TIMEOUT=10; ALL=0; QUIET=0
+USER_SSH=systeam; JOBS=8; SINCE="7 days ago"; TIMEOUT=10; ALL=0; QUIET=0; LOCAL=0
 IPS=()
-while getopts ":f:u:j:s:t:aqh" opt; do
+while getopts ":f:u:j:s:t:aqlh" opt; do
   case "$opt" in
+    l) LOCAL=1 ;;
     f) [ -r "$OPTARG" ] || die "Cannot read $OPTARG"
        while read -r l; do l=${l%%#*}; l=${l//[[:space:]]/}; [ -n "$l" ] && IPS+=("$l"); done < "$OPTARG" ;;
     u) USER_SSH=$OPTARG ;;
@@ -156,6 +174,10 @@ done
 shift $((OPTIND - 1))
 # Accept IPs separated by spaces, commas or newlines.
 for a in "$@"; do for ip in ${a//,/ }; do IPS+=("$ip"); done; done
+if [ "$LOCAL" = 1 ]; then
+  [ "$EUID" -eq 0 ] || die "Local mode (-l) must run as root: sudo bash $0 -l"
+  IPS=(localhost); ALL=1
+fi
 [ "${#IPS[@]}" -gt 0 ] || { usage; die "No IPs given."; }
 
 if [ -t 1 ]; then R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[1m'; N=$'\e[0m'; else R=; G=; Y=; B=; N=; fi
@@ -174,12 +196,18 @@ check_one() {
   echo $? > "$TMP/$ip.rc"
 }
 
-echo "${B}Checking ${#IPS[@]} server(s) as $USER_SSH, $JOBS in parallel, journal since \"$SINCE\"...${N}" >&2
-for ip in "${IPS[@]}"; do
-  while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do wait -n 2>/dev/null || sleep 0.2; done
-  check_one "$ip" &
-done
-wait
+if [ "$LOCAL" = 1 ]; then
+  echo "${B}Checking this server, journal since \"$SINCE\"...${N}" >&2
+  remote_check "$SINCE" > "$TMP/localhost.out" 2> "$TMP/localhost.err"
+  echo 0 > "$TMP/localhost.rc"
+else
+  echo "${B}Checking ${#IPS[@]} server(s) as $USER_SSH, $JOBS in parallel, journal since \"$SINCE\"...${N}" >&2
+  for ip in "${IPS[@]}"; do
+    while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do wait -n 2>/dev/null || sleep 0.2; done
+    check_one "$ip" &
+  done
+  wait
+fi
 
 # Overall per-server result: the worst version status wins.
 rank() { case "$1" in masked) echo 5;; down) echo 4;; recovered) echo 3;; warn) echo 2;; ok) echo 1;; *) echo 0;; esac; }
@@ -228,7 +256,11 @@ for ip in "${IPS[@]}"; do
     [ -n "$pm" ]   && DETAILS+="        masked by patching_php.sh      : $pm"$'\n'
     [ -n "$ans" ]  && DETAILS+="        masked by Ansible task         : $ans"$'\n'
     [ -n "$link" ] && DETAILS+="        mask symlink created           : $link"$'\n'
-    [ -n "$ferr" ] && DETAILS+="        'is masked' errors             : $ferr -> $lerr"$'\n'
+    if [[ "$ferr" == monit:* ]]; then
+      [ "$st" != ok ] && DETAILS+="        monit 'not running' (monit.log): ${ferr#monit:} -> $lerr"$'\n'
+    elif [ -n "$ferr" ]; then
+      DETAILS+="        'is masked' errors             : $ferr -> $lerr"$'\n'
+    fi
     [ -n "$unm" ]  && DETAILS+="        manual unmask                  : $unm"$'\n'
   done < <(grep '^V|' "$out")
   while IFS='|' read -r _ msg; do DETAILS+="  Upgrade    : $msg"$'\n'; done < <(grep '^U|' "$out")
