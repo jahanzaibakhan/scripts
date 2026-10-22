@@ -7,9 +7,12 @@
 #  1. Clearing disk space  runs opsgenie/disk-cleanup.sh. If no space is
 #                          freed, warns "Nothing to clear" and still patches,
 #                          unless less than 500 MiB is available on /.
-#  2. Patching             runs patching_php.sh (embedded below, unchanged) in
+#  2. Sury signing key     replaces expired copies of the DEB.SURY.ORG key
+#                          (php, apache2, nginx repos) with the renewed key from
+#                          packages.sury.org, or apt-get update fails EXPKEYSIG.
+#  3. Patching             runs patching_php.sh (embedded below, unchanged) in
 #                          its own session, so it keeps going if SSH drops.
-#  3. Verify               every installed php*-fpm must be on 20261021.
+#  4. Verify               every installed php*-fpm must be on 20261021.
 #
 # Usage (as root on the server):
 #   curl -fsSL https://raw.githubusercontent.com/jahanzaibakhan/scripts/main/php-patch-with-cleanup.sh | bash
@@ -27,6 +30,8 @@ PATCH_LOG="/var/log/patching_php.log"
 PATCH_VERSION="20261021"
 MIN_FREED_BYTES=$((1024 * 1024))          # under 1 MiB freed counts as nothing cleared
 MIN_FREE_BYTES=$((500 * 1024 * 1024))     # apt needs room to unpack the packages
+SURY_KEY_URL="https://packages.sury.org/php/apt.gpg"
+SURY_FPR="15058500A0235D97F5D10063B188E2B695BD4743"
 
 if [[ -t 1 ]]; then
     C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_RED=$'\033[1;31m'
@@ -284,7 +289,7 @@ chmod 700 "$PATCH_SCRIPT"
 
 clear_disk_space() {
     local before after freed
-    status "[1/3] Clearing disk space..."
+    status "[1/4] Clearing disk space..."
     before=$(physical_free_bytes)
     echo "Free space on / before: $(human_size "$before")"
 
@@ -305,9 +310,96 @@ clear_disk_space() {
     fi
 }
 
+# Prints the Sury key's validity (e=expired) and expiry epoch if the keyring has it.
+sury_key_state() {
+    gpg --no-default-keyring --keyring "$1" --list-keys --with-colons 2>/dev/null |
+        awk -F: -v fpr="$SURY_FPR" '
+            /^pub:/ { v = $2; x = $7 }
+            /^fpr:/ && $10 == fpr { print v, x; exit }
+        '
+}
+
+# Keys in a keyring file (more than one: merge with --import instead of overwriting).
+key_count() {
+    gpg --no-default-keyring --keyring "$1" --list-keys --with-colons 2>/dev/null | grep -c '^pub:'
+}
+
+refresh_sury_key() {
+    local new_key backup_dir f state exp now fixed=0 failed=0
+    status "[2/4] Checking Sury signing key..."
+
+    if ! command -v gpg >/dev/null 2>&1; then
+        warn "gpg is not installed, skipped Sury key check."
+        return
+    fi
+
+    # Throwaway gpg home so nothing lands in /root/.gnupg.
+    export GNUPGHOME
+    GNUPGHOME=$(mktemp -d)
+    new_key="$GNUPGHOME/sury.gpg"
+    now=$(date +%s)
+
+    local -a expired=()
+    for f in /etc/apt/trusted.gpg /etc/apt/trusted.gpg.d/*.gpg /usr/share/keyrings/*.gpg; do
+        [[ -f "$f" ]] || continue
+        state=$(sury_key_state "$f")
+        [[ -n "$state" ]] || continue
+        exp=${state#* }
+        if [[ "${state%% *}" == e ]] || [[ -n "$exp" && "$exp" -le "$now" ]]; then
+            expired+=("$f")
+        fi
+    done
+
+    if (( ${#expired[@]} == 0 )); then
+        ok "Sury key is valid, nothing to refresh."
+        rm -rf "$GNUPGHOME"; unset GNUPGHOME
+        return
+    fi
+    warn "Expired Sury key in ${#expired[@]} keyring(s), fetching renewed key from $SURY_KEY_URL"
+
+    if ! curl -fsSL --max-time 30 "$SURY_KEY_URL" -o "$new_key"; then
+        fail "Could not download $SURY_KEY_URL, apt-get update will likely fail with EXPKEYSIG."
+        rm -rf "$GNUPGHOME"; unset GNUPGHOME
+        return
+    fi
+    exp=$(gpg --show-keys --with-colons "$new_key" 2>/dev/null |
+        awk -F: -v fpr="$SURY_FPR" '/^pub:/ { e = $7 } /^fpr:/ && $10 == fpr { print e; exit }')
+    if [[ -z "$exp" || "$exp" -le "$now" ]]; then
+        fail "Downloaded key is not the Sury key or is still expired, left keyrings unchanged."
+        rm -rf "$GNUPGHOME"; unset GNUPGHOME
+        return
+    fi
+
+    backup_dir="/root/sury-key-backup-$(date +%Y%m%d%H%M%S)"
+    mkdir -p "$backup_dir"
+    for f in "${expired[@]}"; do
+        cp -a "$f" "$backup_dir/$(echo "${f#/}" | tr / _)"
+        if (( $(key_count "$f") > 1 )); then
+            gpg --no-default-keyring --keyring "$f" --import "$new_key" >/dev/null 2>&1
+        else
+            cp "$new_key" "$f" && chmod 644 "$f"
+        fi
+        state=$(sury_key_state "$f")
+        if [[ -n "$state" && "${state%% *}" != e && "${state#* }" -gt "$now" ]]; then
+            echo "  refreshed $f"
+            fixed=$((fixed + 1))
+        else
+            fail "Could not refresh $f"
+            failed=$((failed + 1))
+        fi
+    done
+    rm -rf "$GNUPGHOME"; unset GNUPGHOME
+
+    if (( failed == 0 )); then
+        ok "Sury key refreshed in ${fixed} keyring(s), valid until $(date -d "@$exp" +%Y-%m-%d). Backups: $backup_dir"
+    else
+        warn "Sury key refreshed in ${fixed}, failed in ${failed} keyring(s). Backups: $backup_dir"
+    fi
+}
+
 run_patch() {
     local pid rc last line elapsed=0
-    status "[2/3] Now running patching..."
+    status "[3/4] Now running patching..."
 
     # Patch even when nothing was cleared, as long as apt has room to work.
     if (( $(available_bytes) < MIN_FREE_BYTES )); then
@@ -346,7 +438,7 @@ run_patch() {
 
 verify_patch() {
     local installed unpatched
-    status "[3/3] Patch completed, now verifying..."
+    status "[4/4] Patch completed, now verifying..."
 
     installed=$(dpkg -l 'php[0-9]*-fpm' 2>/dev/null | awk '/^ii/ {print $2, $3}')
     if [[ -z "$installed" ]]; then
@@ -374,6 +466,7 @@ main() {
     fi
 
     clear_disk_space
+    refresh_sury_key
     run_patch
     patch_rc=$?
 
