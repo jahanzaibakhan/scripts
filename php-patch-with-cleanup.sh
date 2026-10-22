@@ -416,12 +416,24 @@ run_patch() {
     setsid -w bash "$PATCH_SCRIPT" < /dev/null > /dev/null 2>&1 &
     pid=$!
 
+    # Terminal: one line redrawn in place, dots every second, status every 10s.
+    # Not a terminal (piped to a file): one line per 10s as before.
+    local cols dots
+    cols=$(tput cols 2>/dev/null || echo 120)
     while kill -0 "$pid" 2>/dev/null; do
-        sleep 10
-        elapsed=$((elapsed + 10))
-        line=$(tail -n +"$((last + 1))" "$PATCH_LOG" | grep -E '\[(INFO|WARN|ERROR)\]' | tail -n 1 | cut -c 21-)
-        printf '  ... %3ss  %s\n' "$elapsed" "${line:-working}"
+        if (( elapsed % 10 == 0 )); then
+            line=$(tail -n +"$((last + 1))" "$PATCH_LOG" | grep -E '\[(INFO|WARN|ERROR)\]' | tail -n 1 | cut -c 21-)
+        fi
+        if [[ -t 1 ]]; then
+            dots=$(printf '%*s' $((elapsed % 3 + 1)) '' | tr ' ' .)
+            printf '\r\033[K  Running%-3s %4ss  %s' "$dots" "$elapsed" "$(cut -c 1-$((cols - 22)) <<< "${line:-working}")"
+        elif (( elapsed > 0 && elapsed % 10 == 0 )); then
+            printf '  ... %3ss  %s\n' "$elapsed" "${line:-working}"
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
     done
+    [[ -t 1 ]] && printf '\r\033[K'
     wait "$pid"
     rc=$?
 
