@@ -65,6 +65,13 @@ button:hover { filter: brightness(0.97); }
 .card.sel { border-color: var(--primary); }
 .card .hint { font-size: 12px; color: var(--muted); margin-top: 2px; }
 .filter-note { font-size: 14px; color: var(--muted); }
+.status-filter { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.status-filter .lbl { font-size: 14px; font-weight: 600; color: var(--muted); margin-right: 2px; }
+.status-filter button { background: var(--btn); padding: 7px 12px; font-size: 14px; display: inline-flex; align-items: center; gap: 6px; }
+.status-filter button .box { width: 14px; height: 14px; border: 2px solid var(--muted); border-radius: 4px; display: inline-grid; place-items: center; font-size: 10px; line-height: 1; }
+.status-filter button.on .box { background: var(--primary); border-color: var(--primary); color: #fff; }
+.status-filter button.on { border-color: var(--primary); }
+.status-filter button[data-st="ALL"].on { background: var(--primary); color: var(--primary-text); }
 .filter-note button { padding: 3px 10px; font-size: 13px; margin-left: 6px; }
 .card .label { font-weight: 600; color: var(--muted); font-size: 14px; }
 .card .num { font-size: 34px; font-weight: 800; margin-top: 4px; }
@@ -144,6 +151,14 @@ pre { background: var(--head); border-radius: 10px; padding: 14px; max-height: 5
             <button data-range="7d">Last 7 Days</button>
             <button data-range="all">All Time</button>
         </div>
+        <div class="status-filter" id="status-filter">
+            <span class="lbl">Status:</span>
+            <button data-st="ALL">All</button>
+            <button data-st="COMPLETED"><span class="box"></span>Completed</button>
+            <button data-st="RUNNING"><span class="box"></span>Running</button>
+            <button data-st="NO_ACTION"><span class="box"></span>No action</button>
+            <button data-st="FAILED"><span class="box"></span>Failed</button>
+        </div>
         <span class="filter-note" id="filter-note"></span>
         <span class="updated" id="updated"></span>
     </section>
@@ -209,6 +224,12 @@ async function load() {
 function renderRows() {
     document.querySelectorAll('#cards [data-status]').forEach(c => c.classList.toggle('sel', selected.has(c.dataset.status)));
     document.getElementById('cards').classList.toggle('filtering', selected.size > 0);
+    document.querySelectorAll('#status-filter [data-st]').forEach(b => {
+        const on = b.dataset.st === 'ALL' ? selected.size === 0 : selected.has(b.dataset.st);
+        b.classList.toggle('on', on);
+        const box = b.querySelector('.box');
+        if (box) box.textContent = on ? '✓' : '';
+    });
     document.getElementById('filter-note').innerHTML = selected.size
         ? 'Showing: ' + [...selected].map(s => esc(LABELS[s])).join(', ') + '<button id="clear-filter">Clear</button>' : '';
     const runs = selected.size ? lastRuns.filter(r => selected.has(r.status)) : lastRuns;
@@ -241,6 +262,17 @@ document.getElementById('cards').addEventListener('click', e => {
     if (!card) return;
     if (card.hasAttribute('data-all')) selected.clear();
     else selected.has(card.dataset.status) ? selected.delete(card.dataset.status) : selected.add(card.dataset.status);
+    saveFilter();
+    renderRows();
+});
+document.getElementById('status-filter').addEventListener('click', e => {
+    const b = e.target.closest('[data-st]');
+    if (!b) return;
+    const st = b.dataset.st;
+    if (st === 'ALL') selected.clear();
+    else selected.has(st) ? selected.delete(st) : selected.add(st);
+    // All four ticked is the same as All.
+    if (selected.size === 4) selected.clear();
     saveFilter();
     renderRows();
 });
