@@ -12,8 +12,8 @@
 #  UPGRADE      the PHP version upgrade playbook masked the old PHP and
 #               enabled the new one before its pools existed, then failed
 #               (e.g. at the newrelic reinstall) with no rollback.
-#  APP_POOL_MISSING  an app's vhost points at an FPM socket with no pool
-#               behind it (site returns 502), e.g. re-running a per-app PHP
+#  APP_POOL_MISSING  an app's nginx/Apache config points at an FPM socket
+#               with no pool behind it (site returns 502/503), e.g. re-running a per-app PHP
 #               change to the version it already had deletes its own pool.
 #
 # A version counts as "in use" if, on multi-app PHP servers, its pool.d has
@@ -145,17 +145,19 @@ remote_check() {
     echo "V|$ver|$role|$apps|$en|$ac|$link|$patch_mask|$mig|$ans|$ferr|$lerr|$unmask|$status|$cause"
   done
 
-  # Apps whose vhost points at an FPM socket that does not exist (site returns 502).
-  local f app sock pv perr pdel
-  for f in /etc/nginx/sites-available/*; do
-    [ -f "$f" ] || continue
-    app=$(basename "$f")
-    sock=$(grep -m1 -oE '/var/run/fpm-[A-Za-z0-9_.-]+\.sock' "$f")
-    [ -n "$sock" ] && [ ! -S "$sock" ] || continue
-    pv=$(grep -h "^$app=" "$fact_dir/applications.fact" 2>/dev/null | cut -d= -f2)
-    perr=$(grep -h "${sock##*/} failed" /home/*/"$app"/logs/*error*.log /var/log/nginx/error.log 2>/dev/null | cut -c1-19 | sort | head -1)
-    pdel=$(printf '%s\n' "$j" | grep -E "path=/etc/php/[0-9.]+/fpm/pool.d/$app-[0-9]+\.conf state=absent" | tail -1 | ts)
-    echo "A|$app|$sock|${pv:-?}|$perr|$pdel"
+  # Apps whose nginx vhost or Apache fcgi config points at an FPM socket that
+  # does not exist (site returns 502/503).
+  local app sock pv perr pdel
+  for app in $( { ls /etc/nginx/sites-available/ 2>/dev/null; ls /etc/apache2/fcgi/ 2>/dev/null | sed 's/\.conf$//'; } | sort -u); do
+    for sock in $(grep -ohE '/var/run/fpm-[A-Za-z0-9_.-]+\.sock' "/etc/nginx/sites-available/$app" "/etc/apache2/fcgi/$app.conf" 2>/dev/null | sort -u); do
+      [ -S "$sock" ] && continue
+      pv=$(grep -h "^$app=" "$fact_dir/applications.fact" 2>/dev/null | cut -d= -f2)
+      perr=$(grep -h "${sock##*/} failed" /home/*/"$app"/logs/*error*.log /var/log/nginx/error.log 2>/dev/null | cut -c1-19 | sort | head -1)
+      [ -z "$perr" ] && perr=$(grep -h "socket $sock .*failed" /var/log/apache2/error.log 2>/dev/null | head -1 \
+        | sed -E 's/^\[[A-Za-z]+ ([A-Za-z]+ [0-9]+ [0-9:]+)\.[0-9]+ ([0-9]+)\].*/\1 \2/')
+      pdel=$(printf '%s\n' "$j" | grep -E "path=/etc/php/[0-9.]+/fpm/pool.d/$app-[0-9]+\.conf state=absent" | tail -1 | ts)
+      echo "A|$app|$sock|${pv:-?}|$perr|$pdel"
+    done
   done
 
   # Upgrade-playbook fingerprints (retries of the failing step).
@@ -288,7 +290,7 @@ for ip in "${IPS[@]}"; do
   while IFS='|' read -r _ app sock pv perr pdel; do
     DETAILS+="  ${R}App down${N}   : $app (php $pv) vhost uses $sock, which does not exist (no pool)"$'\n'
     [ -n "$pdel" ] && DETAILS+="        pool deleted by Ansible task   : $pdel"$'\n'
-    [ -n "$perr" ] && DETAILS+="        first nginx 'failed' error     : $perr"$'\n'
+    [ -n "$perr" ] && DETAILS+="        first web server 'failed' error: $perr"$'\n'
     DETAILS+="        fix: recreate /etc/php/$pv/fpm/pool.d/$app-${pv//./}.conf (or set the app's PHP version again in the platform), then reload php$pv-fpm"$'\n'
   done < <(grep '^A|' "$out")
   while IFS='|' read -r _ msg; do DETAILS+="  Upgrade    : $msg"$'\n'; done < <(grep '^U|' "$out")

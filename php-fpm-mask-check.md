@@ -61,7 +61,7 @@ A version is **in use** if:
 |---|---|
 | `PATCH_RACE` | `patching_php.sh` started, saw a single-PHP server (`multi_php=false`) and recorded which FPM versions were running. The multi-app PHP migration then started the server PHP (usually 8.2) and set `multi_app_php=yes`. When apt finished (or failed), the patch masked that version based on its out-of-date snapshot. |
 | `UPGRADE` | The PHP upgrade playbook masked the old PHP and enabled the new one before the new version's pools existed. It then failed (for example retrying `apt-get install --reinstall newrelic-php5`) and never rolled back. |
-| `APP_POOL_MISSING` | An app's nginx vhost points at an FPM socket that does not exist, so the site returns 502. Seen when a per-app PHP change to 8.4 ran a second time on an app that was already on 8.4: the "remove old pool" step deleted the app's only pool, and the cleanup then masked php8.4 as unused. The details show when the Ansible task deleted the pool and the first nginx `failed` error. |
+| `APP_POOL_MISSING` | An app's nginx vhost or Apache fcgi config points at an FPM socket that does not exist, so the site returns 502/503. Seen when a per-app PHP change to 8.4 ran a second time on an app that was already on 8.4: the "remove old pool" step deleted the app's only pool, and the cleanup then masked php8.4 as unused. The details show when the Ansible task deleted the pool and the first nginx/Apache `failed` error. |
 | `PATCH` | `patching_php.sh` masked an in-use version without the race pattern |
 | `UNKNOWN` | It was masked (`is masked` errors in the journal), but neither job's log shows the mask |
 
