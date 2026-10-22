@@ -12,6 +12,9 @@
 #  UPGRADE      the PHP version upgrade playbook masked the old PHP and
 #               enabled the new one before its pools existed, then failed
 #               (e.g. at the newrelic reinstall) with no rollback.
+#  APP_POOL_MISSING  an app's vhost points at an FPM socket with no pool
+#               behind it (site returns 502), e.g. re-running a per-app PHP
+#               change to the version it already had deletes its own pool.
 #
 # A version counts as "in use" if, on multi-app PHP servers, its pool.d has
 # cloudways.conf (server PHP: Adminer, Imunify360 UI) or app pools; on single
@@ -69,8 +72,9 @@ remote_check() {
     p_start=$(printf '%s' "$run" | grep -m1 'started =====' | cut -c1-19)
     p_multi=$(printf '%s' "$run" | grep -m1 -o 'multi_php=[a-z]*' | cut -d= -f2)
     p_before=$(printf '%s' "$run" | grep -o 'Running before: php[0-9.]*' | sed 's/Running before: php//' | paste -sd, -)
-    if printf '%s' "$run" | grep -q 'apt-get install completed'; then p_apt=ok
-    elif printf '%s' "$run" | grep -q 'apt-get install failed'; then
+    # Here-strings, not pipes: grep -q exits early and pipefail (local mode) would fail the test.
+    if grep -q 'apt-get install completed' <<< "$run"; then p_apt=ok
+    elif grep -q 'apt-get install failed' <<< "$run"; then
       p_apt="failed($(printf '%s' "$run" | grep -o 'apt-get install failed (rc=[0-9]*' | grep -o '[0-9]*$'))"
     else p_apt=unknown; fi
     p_rc=$(printf '%s' "$run" | grep -o 'finished rc=[0-9]*' | tail -1 | cut -d= -f2)
@@ -141,6 +145,19 @@ remote_check() {
     echo "V|$ver|$role|$apps|$en|$ac|$link|$patch_mask|$mig|$ans|$ferr|$lerr|$unmask|$status|$cause"
   done
 
+  # Apps whose vhost points at an FPM socket that does not exist (site returns 502).
+  local f app sock pv perr pdel
+  for f in /etc/nginx/sites-available/*; do
+    [ -f "$f" ] || continue
+    app=$(basename "$f")
+    sock=$(grep -m1 -oE '/var/run/fpm-[A-Za-z0-9_.-]+\.sock' "$f")
+    [ -n "$sock" ] && [ ! -S "$sock" ] || continue
+    pv=$(grep -h "^$app=" "$fact_dir/applications.fact" 2>/dev/null | cut -d= -f2)
+    perr=$(grep -h "${sock##*/} failed" /home/*/"$app"/logs/nginx-app.error.log 2>/dev/null | head -1 | cut -c1-19)
+    pdel=$(printf '%s\n' "$j" | grep -E "path=/etc/php/[0-9.]+/fpm/pool.d/$app-[0-9]+\.conf state=absent" | tail -1 | ts)
+    echo "A|$app|$sock|${pv:-?}|$perr|$pdel"
+  done
+
   # Upgrade-playbook fingerprints (retries of the failing step).
   local nr; nr=$(printf '%s\n' "$j" | grep -c 'reinstall newrelic')
   [ "$nr" -gt 0 ] && echo "U|newrelic reinstall attempts: $nr"
@@ -153,7 +170,7 @@ remote_check() {
 die() { echo "ERROR: $*" >&2; exit 2; }
 usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}" 2>/dev/null; }
 
-USER_SSH=systeam; JOBS=8; SINCE="7 days ago"; TIMEOUT=10; ALL=0; QUIET=0; LOCAL=0
+USER_SSH=systeam; JOBS=8; SINCE="7 days ago"; TIMEOUT=10; ALL=0; VERBOSE=0; QUIET=0; LOCAL=0
 IPS=()
 while getopts ":f:u:j:s:t:aqlh" opt; do
   case "$opt" in
@@ -164,7 +181,7 @@ while getopts ":f:u:j:s:t:aqlh" opt; do
     j) JOBS=$OPTARG ;;
     s) SINCE=$OPTARG ;;
     t) TIMEOUT=$OPTARG ;;
-    a) ALL=1 ;;
+    a) ALL=1; VERBOSE=1 ;;
     q) QUIET=1 ;;
     h) usage; exit 0 ;;
     :) die "-$OPTARG needs a value" ;;
@@ -233,6 +250,11 @@ for ip in "${IPS[@]}"; do
       wwhen=${pm:-${ans:-${ferr:--}}}
     fi
   done < <(grep '^V|' "$out")
+  while IFS='|' read -r _ app sock pv perr pdel; do
+    if [ "$(rank down)" -gt "$(rank "$worst")" ]; then
+      worst=down; wver=$pv; wcause=APP_POOL_MISSING; wnow="app $app"; wwhen=${pdel:-${perr:--}}
+    fi
+  done < <(grep '^A|' "$out")
   verdict=$(echo "$worst" | tr '[:lower:]' '[:upper:]')
   [ "$worst" != ok ] && [ "$EXIT" -lt 1 ] && EXIT=1
   SUMMARY+=("$ip|${host%%.*}|$verdict|$wcause|$wver|$wnow|$wwhen")
@@ -248,7 +270,7 @@ for ip in "${IPS[@]}"; do
   fi
   DETAILS+="  Versions   :"$'\n'
   while IFS='|' read -r _ ver role apps en ac link pm mig ans ferr lerr unm st cause; do
-    [ "$role" = unused ] && [ "$st" = ok ] && [ "$ALL" = 0 ] && continue
+    [ "$role" = unused ] && [ "$st" = ok ] && [ "$VERBOSE" = 0 ] && continue
     line="    php$ver  $(printf '%-12s' "$role") apps=$apps  $en/$ac  -> $st"
     [ "$cause" != - ] && line+=" ($cause)"
     DETAILS+="$line"$'\n'
@@ -263,6 +285,12 @@ for ip in "${IPS[@]}"; do
     fi
     [ -n "$unm" ]  && DETAILS+="        manual unmask                  : $unm"$'\n'
   done < <(grep '^V|' "$out")
+  while IFS='|' read -r _ app sock pv perr pdel; do
+    DETAILS+="  ${R}App down${N}   : $app (php $pv) vhost uses $sock, which does not exist (no pool)"$'\n'
+    [ -n "$pdel" ] && DETAILS+="        pool deleted by Ansible task   : $pdel"$'\n'
+    [ -n "$perr" ] && DETAILS+="        first nginx 'failed' error     : $perr"$'\n'
+    DETAILS+="        fix: recreate /etc/php/$pv/fpm/pool.d/$app-${pv//./}.conf (or set the app's PHP version again in the platform), then reload php$pv-fpm"$'\n'
+  done < <(grep '^A|' "$out")
   while IFS='|' read -r _ msg; do DETAILS+="  Upgrade    : $msg"$'\n'; done < <(grep '^U|' "$out")
   while IFS='|' read -r _ msg; do DETAILS+="  Monit      : $msg"$'\n'; done < <(grep '^M|' "$out")
   while IFS='|' read -r _ msg; do DETAILS+="  ${R}Error${N}      : $msg"$'\n'; done < <(grep '^E|' "$out")
