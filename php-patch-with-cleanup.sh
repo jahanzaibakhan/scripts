@@ -4,6 +4,12 @@
 # Frees disk space, applies the PHP vulnerability fix (patching_php.sh), then
 # verifies the patched php*-fpm packages (version 20261021).
 #
+# Pre-checks run in the terminal (a few seconds): root, no patch already
+# running, Debian 11+, not already patched. Steps 1-4 then run in a detached
+# screen session named "php" (setsid if screen is missing), which closes by
+# itself when done. The full result is written to /var/log/php-patch-summary.log,
+# ending with one "RESULT: ..." line.
+#
 #  1. Clearing disk space  runs opsgenie/disk-cleanup.sh. If no space is
 #                          freed, warns "Nothing to clear" and still patches,
 #                          unless less than 500 MiB is available on /.
@@ -16,8 +22,10 @@
 #
 # Usage (as root on the server):
 #   curl -fsSL https://raw.githubusercontent.com/jahanzaibakhan/scripts/main/php-patch-with-cleanup.sh | bash
+#   ... | bash -s -- --foreground      # old behaviour: run everything in this terminal
 #
 # Logs:
+#   /var/log/php-patch-summary.log      result of the last run (what you saw on screen)
 #   /var/log/patching_php_cleanup.log   disk cleanup output
 #   /var/log/patching_php.log           patch output (timestamped)
 
@@ -29,6 +37,10 @@ PATCH_SCRIPT="/root/patching_php.sh"
 PATCH_LOG="/var/log/patching_php.log"
 PATCH_LOCK="/var/run/patching_php.lock"
 PATCH_VERSION="20261021"
+SUMMARY_LOG="/var/log/php-patch-summary.log"
+RUN_SCRIPT="/root/php-patch-run.sh"
+RUN_LOCK="/var/run/php-patch-with-cleanup.lock"
+SCREEN_NAME="php"
 MIN_FREED_BYTES=$((1024 * 1024))          # under 1 MiB freed counts as nothing cleared
 MIN_FREE_BYTES=$((500 * 1024 * 1024))     # apt needs room to unpack the packages
 SURY_KEY_URL="https://packages.sury.org/php/apt.gpg"
@@ -411,30 +423,30 @@ run_patch() {
     write_patch_script
     : >> "$PATCH_LOG"
     last=$(wc -l < "$PATCH_LOG")
-    echo "Patch log: $PATCH_LOG (the patch keeps running even if this SSH session drops)"
+    echo "Patch log: $PATCH_LOG"
 
     # Own session: an SSH disconnect kills this wrapper but not the patch.
-    setsid -w bash "$PATCH_SCRIPT" < /dev/null > /dev/null 2>&1 &
+    setsid -w bash "$PATCH_SCRIPT" < /dev/null > /dev/null 2>&1 3>&- &
     pid=$!
 
-    # Terminal: one line redrawn in place, dots every second, status every 10s.
-    # Not a terminal (piped to a file): one line per 10s as before.
+    # Terminal: one line redrawn in place on fd 3 (kept out of the summary log),
+    # dots every second, status every 10s. No terminal: one line per 10s.
     local cols dots
     cols=$(tput cols 2>/dev/null || echo 120)
     while kill -0 "$pid" 2>/dev/null; do
         if (( elapsed % 10 == 0 )); then
             line=$(tail -n +"$((last + 1))" "$PATCH_LOG" | grep -E '\[(INFO|WARN|ERROR)\]' | tail -n 1 | cut -c 21-)
         fi
-        if [[ -t 1 ]]; then
+        if [[ -n "$SPIN" ]]; then
             dots=$(printf '%*s' $((elapsed % 3 + 1)) '' | tr ' ' .)
-            printf '\r\033[K  Running%-3s %4ss  %s' "$dots" "$elapsed" "$(cut -c 1-$((cols - 22)) <<< "${line:-working}")"
+            printf '\r\033[K  Running%-3s %4ss  %s' "$dots" "$elapsed" "$(cut -c 1-$((cols - 22)) <<< "${line:-working}")" >&3
         elif (( elapsed > 0 && elapsed % 10 == 0 )); then
             printf '  ... %3ss  %s\n' "$elapsed" "${line:-working}"
         fi
         sleep 1
         elapsed=$((elapsed + 1))
     done
-    [[ -t 1 ]] && printf '\r\033[K'
+    [[ -n "$SPIN" ]] && printf '\r\033[K' >&3
     wait "$pid"
     rc=$?
 
@@ -501,18 +513,97 @@ show_running_patch() {
     echo "  tail -f $PATCH_LOG"
 }
 
-main() {
+# Last line of the summary log, read by fleet tooling: RESULT: <STATE> <detail>
+RESULT=""
+IN_RUN=""
+write_result() {
+    RESULT="$1"
+    if [[ -n "$IN_RUN" ]]; then
+        printf 'RESULT: %s %s\n' "$1" "$2"     # stdout already copies to the summary
+    else
+        printf 'RESULT: %s %s\n' "$1" "$2" | tee -a "$SUMMARY_LOG"
+    fi
+}
+
+# On exit of run_all: make sure a RESULT line exists, then let the log copier finish
+# before the screen closes (it would otherwise be cut off by the hangup).
+finish_run() {
+    [[ -n "$RESULT" ]] || write_result FAILED "see $PATCH_LOG"
+    exec >&- 2>&-
+    wait "$OUT_PID" 2>/dev/null
+}
+
+# Another run of this wrapper (cleanup/Sury phase, before the patch starts).
+wrapper_running() {
+    [[ -e "$RUN_LOCK" ]] && ! flock -n "$RUN_LOCK" true 2>/dev/null
+}
+
+# Quick checks in the terminal. Exits when there is nothing to do or it cannot work.
+preflight() {
+    local deb major installed unpatched
+    status "Pre-checks..."
+
+    if wrapper_running || [[ -n "$(running_patch_pids)" ]]; then
+        if [[ -n "$(running_patch_pids)" ]]; then
+            show_running_patch
+        else
+            fail "php-patch-with-cleanup.sh is already running on this server (cleanup/key step), not starting another run."
+            command -v screen >/dev/null 2>&1 && screen -ls 2>/dev/null | grep -q "\.${SCREEN_NAME}[[:space:]]" &&
+                echo "Watch it: screen -r ${SCREEN_NAME}   (detach: Ctrl+A then D)"
+            echo "Result when done: cat $SUMMARY_LOG"
+        fi
+        # Keep the running job's summary; this run only reports.
+        exit 1
+    fi
+    ok "No patch is running."
+    : > "$SUMMARY_LOG"
+
+    deb=$(cat /etc/debian_version 2>/dev/null)
+    major=${deb%%.*}
+    if [[ "$major" =~ ^[0-9]+$ ]] && (( major < 11 )); then
+        fail "Debian ${deb}: no patched PHP build (${PATCH_VERSION}) exists for this release. Upgrade the OS to Debian 11/12 first."
+        write_result UNSUPPORTED "debian=${deb}"
+        exit 1
+    fi
+    ok "Debian ${deb:-unknown}."
+
+    installed=$(dpkg -l 'php[0-9]*-fpm' 2>/dev/null | awk '/^ii/ {print $2, $3}')
+    unpatched=$(grep -v "$PATCH_VERSION" <<< "$installed")
+    if [[ -n "$installed" && -z "$unpatched" ]]; then
+        sed 's/^/  /' <<< "$installed"
+        ok "Already patched: all installed php*-fpm packages are on ${PATCH_VERSION}. Nothing to do."
+        write_result ALREADY_PATCHED "$(awk '{print $1}' <<< "$installed" | paste -sd, -)"
+        exit 0
+    fi
+    if [[ -n "$unpatched" ]]; then
+        echo "Not on ${PATCH_VERSION} yet:"
+        sed 's/^/  /' <<< "$unpatched"
+    fi
+}
+
+# Steps 1-4. Everything printed also goes to the summary log (colours stripped).
+run_all() {
     local patch_rc
-    if [[ $(id -u) -ne 0 ]]; then
-        fail "Must run as root."
+    exec 8>"$RUN_LOCK"
+    if ! flock -n 8; then
+        fail "php-patch-with-cleanup.sh is already running on this server."
         exit 1
     fi
 
-    # Before the cleanup, so a second run changes nothing while one is in progress.
-    if [[ -n "$(running_patch_pids)" ]]; then
-        show_running_patch
-        exit 1
+    SPIN=""
+    if [[ -t 1 ]]; then
+        exec 3>&1
+        SPIN=1
     fi
+    # One copier process: line to the terminal as is, and to the summary without colours.
+    exec > >(while IFS= read -r line || [[ -n "$line" ]]; do
+        printf '%s\n' "$line"
+        printf '%s\n' "$line" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' >> "$SUMMARY_LOG"
+    done) 2>&1
+    OUT_PID=$!
+    IN_RUN=1
+    trap finish_run EXIT
+    status "Started $(date '+%Y-%m-%d %H:%M:%S %Z') on $(hostname)"
 
     clear_disk_space
     refresh_sury_key
@@ -521,10 +612,61 @@ main() {
 
     if verify_patch && (( patch_rc == 0 )); then
         status "DONE: disk cleared, PHP patched and verified."
+        write_result PATCHED "$(dpkg -l 'php[0-9]*-fpm' 2>/dev/null | awk '/^ii/ {print $2}' | paste -sd, -)"
         exit 0
     fi
     status "FINISHED WITH ERRORS: check $PATCH_LOG"
+    write_result FAILED "patch_rc=${patch_rc}, see $PATCH_LOG"
     exit 1
+}
+
+# Writes this script's variables and functions to a file and runs run_all from
+# it in the background. Needed because under curl | bash there is no file to rerun.
+start_background() {
+    {
+        echo '#!/usr/bin/env bash'
+        echo '# Generated by php-patch-with-cleanup.sh; runs steps 1-4.'
+        echo 'set -o pipefail'
+        declare -p CLEANUP_URL CLEANUP_LOG PATCH_SCRIPT PATCH_LOG PATCH_LOCK PATCH_VERSION \
+            SUMMARY_LOG RUN_SCRIPT RUN_LOCK SCREEN_NAME MIN_FREED_BYTES MIN_FREE_BYTES \
+            SURY_KEY_URL SURY_FPR C_RESET C_BOLD C_RED C_GREEN C_YELLOW C_CYAN
+        declare -f
+        echo 'run_all'
+    } > "$RUN_SCRIPT"
+    chmod 700 "$RUN_SCRIPT"
+    if ! bash -n "$RUN_SCRIPT"; then
+        fail "Could not generate $RUN_SCRIPT, run with: bash -s -- --foreground"
+        exit 1
+    fi
+
+    status "Starting cleanup, key check, patch and verify in the background..."
+    if command -v screen >/dev/null 2>&1; then
+        screen -dmS "$SCREEN_NAME" bash "$RUN_SCRIPT"
+        ok "Started in screen '${SCREEN_NAME}'. It closes by itself when done."
+        echo "  Watch live:   screen -r ${SCREEN_NAME}   (detach again: Ctrl+A then D)"
+    else
+        setsid bash "$RUN_SCRIPT" < /dev/null > /dev/null 2>&1 &
+        ok "Started in the background (screen is not installed)."
+    fi
+    echo "  Progress:     tail -f $PATCH_LOG"
+    echo "  Result:       cat $SUMMARY_LOG   (last line: RESULT: PATCHED / FAILED ...)"
+    echo "You can close this session now."
+}
+
+main() {
+    local foreground=false
+    [[ "${1:-}" == "--foreground" ]] && foreground=true
+
+    if [[ $(id -u) -ne 0 ]]; then
+        fail "Must run as root."
+        exit 1
+    fi
+
+    preflight
+    if [[ "$foreground" == true ]]; then
+        run_all
+    fi
+    start_background
 }
 
 # Wrapped in main so bash reads the whole script before running (curl | bash).
