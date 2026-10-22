@@ -25,6 +25,10 @@
 #   curl -fsSL https://raw.githubusercontent.com/jahanzaibakhan/scripts/main/php-patch-with-cleanup.sh | bash
 #   ... | bash -s -- --foreground      # old behaviour: run everything in this terminal
 #
+# Dashboard reporting (RUNNING / COMPLETED / NO_ACTION / FAILED, with the log):
+#   PATCH_REPORT_TOKEN='<token>' bash -c "$(curl -fsSL https://raw.githubusercontent.com/jahanzaibakhan/scripts/main/php-patch-with-cleanup.sh)"
+# Without PATCH_REPORT_TOKEN nothing is reported. PATCH_REPORT_URL overrides the endpoint.
+#
 # Logs:
 #   /var/log/php-patch-summary.log      result of the last run (what you saw on screen)
 #   /var/log/patching_php_cleanup.log   disk cleanup output
@@ -42,6 +46,11 @@ SUMMARY_LOG="/var/log/php-patch-summary.log"
 RUN_SCRIPT="/root/php-patch-run.sh"
 RUN_LOCK="/var/run/php-patch-with-cleanup.lock"
 SCREEN_NAME="php"
+PATCH_REPORT_URL="${PATCH_REPORT_URL:-https://phpstack-1503702-6743017.cloudwaysapps.com/api/report.php}"
+PATCH_REPORT_TOKEN="${PATCH_REPORT_TOKEN:-}"
+RUN_ID=""
+SERVER_IP=""
+RUN_STARTED_AT=""
 MIN_FREED_BYTES=$((1024 * 1024))          # under 1 MiB freed counts as nothing cleared
 MIN_FREE_BYTES=$((500 * 1024 * 1024))     # apt needs room to unpack the packages
 SURY_KEY_URL="https://packages.sury.org/php/apt.gpg"
@@ -446,6 +455,10 @@ run_patch() {
         if (( elapsed % 10 == 0 )); then
             line=$(tail -n +"$((last + 1))" "$PATCH_LOG" | grep -E '\[(INFO|WARN|ERROR)\]' | tail -n 1 | cut -c 21-)
         fi
+        # Keep the dashboard's RUNNING row current, without holding up the loop.
+        if (( elapsed > 0 && elapsed % 60 == 0 )); then
+            report_status RUNNING "${line:-Patching}" 1 < /dev/null > /dev/null 2>&1 3>&- &
+        fi
         if [[ -n "$SPIN" ]]; then
             dots=$(printf '%*s' $((elapsed % 3 + 1)) '' | tr ' ' .)
             printf '\r\033[K  Running%-3s %4ss  %s' "$dots" "$elapsed" "$(cut -c 1-$((cols - 22)) <<< "${line:-working}")" >&3
@@ -522,24 +535,94 @@ show_running_patch() {
     echo "  tail -f $PATCH_LOG"
 }
 
+init_reporting() {
+    if [[ -z "$PATCH_REPORT_TOKEN" ]]; then
+        warn "Dashboard reporting off (no PATCH_REPORT_TOKEN)."
+        return
+    fi
+    SERVER_IP=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+    RUN_ID="$(hostname -s)-$(date +%s)"
+    RUN_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    ok "Dashboard reporting on (${SERVER_IP})."
+}
+
+# JSON string body: escape \ and ", turn newlines into \n, drop other control
+# characters and invalid UTF-8.
+json_str() {
+    printf '%s' "$1" | { if command -v iconv >/dev/null 2>&1; then iconv -f UTF-8 -t UTF-8 -c; else cat; fi; } |
+        sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' | tr -d '\000-\010\013-\037' |
+        awk 'BEGIN { ORS = "" } NR > 1 { print "\\n" } { print }'
+}
+
+# $1 status (RUNNING/COMPLETED/NO_ACTION/FAILED), $2 current step, $3 attempts.
+report_status() {
+    [[ -n "$PATCH_REPORT_TOKEN" && -n "$RUN_ID" ]] || return 0
+    local payload attempt packages
+    packages=$(dpkg -l 'php[0-9]*-fpm' 2>/dev/null | awk '/^ii/ {print $2 "=" $3}' | paste -sd, -)
+    payload=$(mktemp)
+    printf '{"runId":"%s","serverIp":"%s","hostname":"%s","status":"%s","result":"%s","detail":"%s","step":"%s","packages":"%s","startedAt":"%s","log":"%s"}' \
+        "$RUN_ID" "$SERVER_IP" "$(json_str "$(hostname -f 2>/dev/null || hostname)")" "$1" \
+        "$(json_str "$RESULT")" "$(json_str "$RESULT_DETAIL")" "$(json_str "$2")" "$(json_str "$packages")" \
+        "$RUN_STARTED_AT" "$(json_str "$(tail -n 600 "$SUMMARY_LOG" 2>/dev/null)")" > "$payload"
+    for ((attempt = 1; attempt <= ${3:-1}; attempt++)); do
+        if curl -fsS --connect-timeout 10 --max-time 30 -X POST "$PATCH_REPORT_URL" \
+            -H "Authorization: Bearer ${PATCH_REPORT_TOKEN}" -H "Content-Type: application/json" \
+            --data-binary @"$payload" >/dev/null 2>&1; then
+            rm -f "$payload"
+            return 0
+        fi
+        (( attempt < ${3:-1} )) && sleep 10
+    done
+    rm -f "$payload"
+    return 1
+}
+
+# Dashboard status for a RESULT state.
+result_status() {
+    case "$1" in
+        PATCHED) echo COMPLETED ;;
+        ALREADY_PATCHED) echo NO_ACTION ;;
+        *) echo FAILED ;;
+    esac
+}
+
+report_final() {
+    [[ -n "$PATCH_REPORT_TOKEN" && -n "$RUN_ID" ]] || return 0
+    if report_status "$(result_status "$RESULT")" "" 3; then
+        ok "Result sent to the dashboard."
+    else
+        warn "Could not send the result to the dashboard."
+    fi
+}
+
 # Last line of the summary log, read by fleet tooling: RESULT: <STATE> <detail>
 RESULT=""
+RESULT_DETAIL=""
 IN_RUN=""
 write_result() {
     RESULT="$1"
+    RESULT_DETAIL="$2"
     if [[ -n "$IN_RUN" ]]; then
         printf 'RESULT: %s %s\n' "$1" "$2"     # stdout already copies to the summary
     else
         printf 'RESULT: %s %s\n' "$1" "$2" | tee -a "$SUMMARY_LOG"
+        report_final
     fi
 }
 
 # On exit: make sure a RESULT line exists, then let the log copier finish
 # before the screen closes (it would otherwise be cut off by the hangup).
+# The dashboard gets the summary only after that, so its log is complete.
 finish_run() {
     [[ -n "$RESULT" ]] || write_result FAILED "see $PATCH_LOG"
     exec >&- 2>&-
     wait "$OUT_PID" 2>/dev/null
+    if [[ "$RESULT" == BACKGROUND ]]; then
+        RESULT=""
+        report_status RUNNING "Patching in the background (screen ${SCREEN_NAME})" 3
+    else
+        report_status "$(result_status "$RESULT")" "" 3
+    fi
 }
 
 # Another run of this wrapper (cleanup/Sury phase, before the patch starts).
@@ -649,6 +732,7 @@ start_background() {
         echo '# Generated by php-patch-with-cleanup.sh; runs steps 3-4 (patch, verify).'
         echo 'set -o pipefail'
         declare -p CLEANUP_URL CLEANUP_LOG PATCH_SCRIPT PATCH_LOG PATCH_LOCK PATCH_VERSION \
+            PATCH_REPORT_URL PATCH_REPORT_TOKEN RUN_ID SERVER_IP RUN_STARTED_AT \
             SUMMARY_LOG RUN_SCRIPT RUN_LOCK SCREEN_NAME MIN_FREED_BYTES MIN_FREE_BYTES \
             SURY_KEY_URL SURY_FPR C_RESET C_BOLD C_RED C_GREEN C_YELLOW C_CYAN
         declare -f
@@ -686,10 +770,12 @@ main() {
         exit 1
     fi
 
+    init_reporting
     preflight
     hold_run_lock
     start_summary_copy
     status "Started $(date '+%Y-%m-%d %H:%M:%S %Z') on $(hostname)"
+    report_status RUNNING "Pre-checks passed, clearing disk and checking Sury key" 1 < /dev/null > /dev/null 2>&1 3>&- &
     clear_disk_space
     refresh_sury_key
     check_disk_space
