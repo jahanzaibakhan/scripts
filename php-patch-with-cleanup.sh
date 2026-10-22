@@ -5,7 +5,7 @@
 # verifies the patched php*-fpm packages (version 20261021).
 #
 # In the terminal: pre-checks (root, no patch already running, Debian 11+, not
-# already patched), then steps 1-2 and the free-space check, so any reason the
+# already patched, apt/dpkg not busy), then steps 1-2 and the free-space check, so any reason the
 # patch cannot run is shown right there. Only steps 3-4 (patch, verify) run in a
 # detached screen session named "php" (setsid if screen is missing), which
 # closes by itself when done. The full result is written to /var/log/php-patch-summary.log,
@@ -673,6 +673,76 @@ wrapper_running() {
     [[ -e "$RUN_LOCK" ]] && ! flock -n "$RUN_LOCK" true 2>/dev/null
 }
 
+APT_STUCK_SECS=3600     # an apt/dpkg holder running longer than this is flagged as likely stuck
+
+# 93784 -> "1d 2h 3m"
+human_duration() {
+    local s=$1 out=""
+    (( s < 60 )) && { echo "${s}s"; return; }
+    (( s >= 86400 )) && out+="$((s / 86400))d "
+    (( s >= 3600 )) && out+="$((s % 86400 / 3600))h "
+    out+="$((s % 3600 / 60))m"
+    echo "$out"
+}
+
+# What started PID $1: the first ancestor that is a cron job, apt's daily timer
+# or unattended-upgrades, otherwise the direct parent.
+apt_starter() {
+    local p=$1 cmd parent="" hops=0 hit
+    while p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ') && [[ -n "$p" && "$p" != 0 && "$p" != 1 ]] && (( hops++ < 10 )); do
+        cmd=$(ps -o args= -p "$p" 2>/dev/null)
+        [[ -z "$parent" ]] && parent=$cmd
+        hit=$(grep -oE '/etc/cron\.[a-z]+/[^ ]+|apt\.systemd\.daily|unattended-upgrade[^ ]*' <<< "$cmd" | head -n 1)
+        [[ -n "$hit" ]] && { echo "$hit"; return; }
+    done
+    echo "${parent:-unknown}" | cut -c 1-80
+}
+
+# Same checks patching_php.sh makes (package manager processes, then apt/dpkg
+# locks), but here in the terminal before any cleanup, naming who holds it.
+apt_busy_check() {
+    local pids="" proc lock pid secs=-1 s cmd prog dur starter
+    for proc in dpkg apt-get apt aptitude unattended-upgr; do
+        pids+=" $(pgrep -x "$proc" | tr '\n' ' ')"
+    done
+    if command -v fuser >/dev/null 2>&1; then
+        for lock in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock; do
+            pids+=" $(fuser "$lock" 2>/dev/null)"
+        done
+    fi
+    pids=$(tr -s ' ' '\n' <<< "$pids" | grep -E '^[0-9]+$' | sort -un)
+    if [[ -z "$pids" ]]; then
+        ok "apt/dpkg is free."
+        return
+    fi
+
+    # Report the longest-running holder; it is the one blocking the others.
+    for s in $pids; do
+        local t
+        t=$(ps -o etimes= -p "$s" 2>/dev/null | tr -d ' ')
+        [[ -n "$t" ]] && (( t > secs )) && { secs=$t; pid=$s; }
+    done
+    [[ -n "${pid:-}" ]] || { ok "apt/dpkg is free."; return; }
+    cmd=$(ps -o args= -p "$pid" 2>/dev/null | cut -c 1-100)
+    prog=${cmd%% *}
+    prog=${prog##*/}
+    dur=$(human_duration "$secs")
+    starter=$(apt_starter "$pid")
+
+    fail "apt/dpkg is busy, patch not started: PID ${pid} \"${cmd}\" running ${dur} (started by ${starter})."
+    echo "All apt/dpkg processes:"
+    ps -o pid=,etime=,args= -p "$(tr '\n' ',' <<< "$pids" | sed 's/,$//')" 2>/dev/null | cut -c 1-140 | sed 's/^/  /'
+    if (( secs >= APT_STUCK_SECS )); then
+        warn "Looks stuck (running over $(human_duration "$APT_STUCK_SECS")). Check it is not installing anything, then stop it and rerun:"
+        echo "  kill ${pid}"
+        write_result FAILED "apt_busy: ${prog} pid ${pid} running ${dur}, likely stuck (started by ${starter})"
+    else
+        echo "It is probably still working: wait a few minutes and rerun this script."
+        write_result FAILED "apt_busy: ${prog} pid ${pid} running ${dur} (started by ${starter})"
+    fi
+    exit 1
+}
+
 # Quick checks in the terminal. Exits when there is nothing to do or it cannot work.
 preflight() {
     local deb major installed unpatched
@@ -714,6 +784,8 @@ preflight() {
         echo "Not on ${PATCH_VERSION} yet:"
         sed 's/^/  /' <<< "$unpatched"
     fi
+
+    apt_busy_check
 }
 
 # $1: seconds to wait for the lock (the background run waits for the terminal run to let go).
