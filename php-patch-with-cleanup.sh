@@ -5,7 +5,8 @@
 # verifies the patched php*-fpm packages (version 20261021).
 #
 #  1. Clearing disk space  runs opsgenie/disk-cleanup.sh. If no space is
-#                          freed, stops with "Nothing to clear" and does not patch.
+#                          freed, warns "Nothing to clear" and still patches,
+#                          unless less than 500 MiB is available on /.
 #  2. Patching             runs patching_php.sh (embedded below, unchanged) in
 #                          its own session, so it keeps going if SSH drops.
 #  3. Verify               every installed php*-fpm must be on 20261021.
@@ -298,16 +299,17 @@ clear_disk_space() {
     echo "Free space on / after:  $(human_size "$after")"
 
     if (( freed < MIN_FREED_BYTES )); then
-        fail "Nothing to clear: no disk space was freed (details: $CLEANUP_LOG). Patching not started."
-        exit 1
+        warn "Nothing to clear: no disk space was freed (details: $CLEANUP_LOG)."
+    else
+        ok "Disk space cleared: $(human_size "$freed") freed."
     fi
-    ok "Disk space cleared: $(human_size "$freed") freed."
 }
 
 run_patch() {
     local pid rc last line elapsed=0
-    status "[2/3] Disk space cleared, now running patching..."
+    status "[2/3] Now running patching..."
 
+    # Patch even when nothing was cleared, as long as apt has room to work.
     if (( $(available_bytes) < MIN_FREE_BYTES )); then
         fail "Only $(human_size "$(available_bytes)") available on /, need $(human_size "$MIN_FREE_BYTES") for apt. Patching not started."
         exit 1
