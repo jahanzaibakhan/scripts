@@ -27,6 +27,7 @@ CLEANUP_URL="https://raw.githubusercontent.com/jahanzaibakhan/opsgenie/main/disk
 CLEANUP_LOG="/var/log/patching_php_cleanup.log"
 PATCH_SCRIPT="/root/patching_php.sh"
 PATCH_LOG="/var/log/patching_php.log"
+PATCH_LOCK="/var/run/patching_php.lock"
 PATCH_VERSION="20261021"
 MIN_FREED_BYTES=$((1024 * 1024))          # under 1 MiB freed counts as nothing cleared
 MIN_FREE_BYTES=$((500 * 1024 * 1024))     # apt needs room to unpack the packages
@@ -440,6 +441,12 @@ run_patch() {
     # Show this run's status lines from the patch log.
     tail -n +"$((last + 1))" "$PATCH_LOG" | grep -E '\[(INFO|WARN|ERROR)\]' | cut -c 21- | sed 's/^/  /'
 
+    # Another run took the lock between our check and this start.
+    if tail -n +"$((last + 1))" "$PATCH_LOG" | grep -q 'Another patching_php.sh is already running'; then
+        show_running_patch
+        exit 1
+    fi
+
     if (( rc == 0 )); then
         ok "Patch completed."
     else
@@ -470,10 +477,40 @@ verify_patch() {
     ok "Verified: all installed php*-fpm packages are on ${PATCH_VERSION}."
 }
 
+# PIDs of a patching_php.sh run in progress (holder of its lock), if any.
+running_patch_pids() {
+    local pids
+    pids=$(pgrep -f '^(/usr)?(/bin/)?bash .*patching_php\.sh' | grep -vx "$$")
+    if [[ -z "$pids" && -e "$PATCH_LOCK" ]] && ! flock -n "$PATCH_LOCK" true 2>/dev/null; then
+        pids=$(fuser "$PATCH_LOCK" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$')
+    fi
+    echo $pids
+}
+
+show_running_patch() {
+    local pids line
+    pids=$(running_patch_pids)
+    fail "patching_php.sh is already running on this server, not starting another run."
+    if [[ -n "$pids" ]]; then
+        echo "Running process(es):"
+        ps -o pid=,etime=,cmd= -p "${pids// /,}" 2>/dev/null | sed 's/^/  PID /'
+    fi
+    line=$(grep -E '\[(INFO|WARN|ERROR)\]' "$PATCH_LOG" 2>/dev/null | tail -n 1 | cut -c 21-)
+    [[ -n "$line" ]] && echo "Its latest step: $line"
+    echo "Wait for it to finish, then rerun this script. Follow it with:"
+    echo "  tail -f $PATCH_LOG"
+}
+
 main() {
     local patch_rc
     if [[ $(id -u) -ne 0 ]]; then
         fail "Must run as root."
+        exit 1
+    fi
+
+    # Before the cleanup, so a second run changes nothing while one is in progress.
+    if [[ -n "$(running_patch_pids)" ]]; then
+        show_running_patch
         exit 1
     fi
 
