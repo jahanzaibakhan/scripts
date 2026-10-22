@@ -59,7 +59,13 @@ button, .btn { font: inherit; font-weight: 600; border: 1px solid var(--line); b
 button:hover { filter: brightness(0.97); }
 .primary { background: var(--primary); color: var(--primary-text); border-color: var(--primary); }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 16px; margin-bottom: 24px; }
-.card { border-radius: 14px; padding: 18px 20px; border: 1px solid var(--line); }
+.card { border-radius: 14px; padding: 18px 20px; border: 2px solid transparent; text-align: left; font: inherit; color: inherit; cursor: pointer; transition: opacity .15s, border-color .15s; }
+.card:hover { filter: brightness(0.98); }
+.cards.filtering .card[data-status]:not(.sel) { opacity: 0.45; }
+.card.sel { border-color: var(--primary); }
+.card .hint { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.filter-note { font-size: 14px; color: var(--muted); }
+.filter-note button { padding: 3px 10px; font-size: 13px; margin-left: 6px; }
 .card .label { font-weight: 600; color: var(--muted); font-size: 14px; }
 .card .num { font-size: 34px; font-weight: 800; margin-top: 4px; }
 .c-total { background: var(--total); } .c-ok { background: var(--ok-bg); } .c-run { background: var(--run-bg); }
@@ -123,12 +129,12 @@ pre { background: var(--head); border-radius: 10px; padding: 14px; max-height: 5
         </div>
     </header>
 
-    <section class="cards">
-        <div class="card c-total"><div class="label">Total servers</div><div class="num" id="n-total">0</div></div>
-        <div class="card c-ok"><div class="label">Completed</div><div class="num" id="n-COMPLETED">0</div></div>
-        <div class="card c-run"><div class="label">Running</div><div class="num" id="n-RUNNING">0</div></div>
-        <div class="card c-none"><div class="label">No action</div><div class="num" id="n-NO_ACTION">0</div></div>
-        <div class="card c-fail"><div class="label">Failed</div><div class="num" id="n-FAILED">0</div></div>
+    <section class="cards" id="cards">
+        <button class="card c-total" data-all title="Show all statuses"><div class="label">Total servers</div><div class="num" id="n-total">0</div><div class="hint">Show all</div></button>
+        <button class="card c-ok" data-status="COMPLETED" title="Click to filter, click more to combine"><div class="label">Completed</div><div class="num" id="n-COMPLETED">0</div></button>
+        <button class="card c-run" data-status="RUNNING" title="Click to filter, click more to combine"><div class="label">Running</div><div class="num" id="n-RUNNING">0</div></button>
+        <button class="card c-none" data-status="NO_ACTION" title="Click to filter, click more to combine"><div class="label">No action</div><div class="num" id="n-NO_ACTION">0</div></button>
+        <button class="card c-fail" data-status="FAILED" title="Click to filter, click more to combine"><div class="label">Failed</div><div class="num" id="n-FAILED">0</div></button>
     </section>
 
     <section class="toolbar">
@@ -138,6 +144,7 @@ pre { background: var(--head); border-radius: 10px; padding: 14px; max-height: 5
             <button data-range="7d">Last 7 Days</button>
             <button data-range="all">All Time</button>
         </div>
+        <span class="filter-note" id="filter-note"></span>
         <span class="updated" id="updated"></span>
     </section>
 
@@ -157,7 +164,11 @@ pre { background: var(--head); border-radius: 10px; padding: 14px; max-height: 5
 <script>
 const LABELS = { COMPLETED: 'Completed', RUNNING: 'Running', NO_ACTION: 'No action', FAILED: 'Failed' };
 const ICONS = { COMPLETED: '✓', NO_ACTION: '–', FAILED: '✕' };
-let range = 'today', timer;
+let range = 'today', timer, lastRuns = [];
+
+// Status filter: empty set = all statuses. Remembered per browser.
+const selected = new Set((() => { try { return JSON.parse(localStorage.getItem('statusFilter') || '[]'); } catch { return []; } })());
+function saveFilter() { try { localStorage.setItem('statusFilter', JSON.stringify([...selected])); } catch {} }
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const karachi = utc => utc ? new Date(utc.replace(' ', 'T') + 'Z').toLocaleString('en-GB', {
@@ -186,19 +197,29 @@ async function load() {
         const data = await res.json();
         document.getElementById('n-total').textContent = data.total;
         for (const s in data.counts) document.getElementById('n-' + s).textContent = data.counts[s];
-        document.getElementById('rows').innerHTML = data.runs.length ? data.runs.map(r => `
+        lastRuns = data.runs;
+        renderRows();
+        document.getElementById('updated').textContent = 'Updated ' + karachi(data.serverTime.replace('T', ' ').slice(0, 19)) + ' · auto-refresh 15s';
+    } catch (e) {
+        document.getElementById('updated').textContent = 'Could not load data, retrying...';
+    }
+    timer = setTimeout(load, 15000);
+}
+
+function renderRows() {
+    document.querySelectorAll('#cards [data-status]').forEach(c => c.classList.toggle('sel', selected.has(c.dataset.status)));
+    document.getElementById('cards').classList.toggle('filtering', selected.size > 0);
+    document.getElementById('filter-note').innerHTML = selected.size
+        ? 'Showing: ' + [...selected].map(s => esc(LABELS[s])).join(', ') + '<button id="clear-filter">Clear</button>' : '';
+    const runs = selected.size ? lastRuns.filter(r => selected.has(r.status)) : lastRuns;
+    document.getElementById('rows').innerHTML = runs.length ? runs.map(r => `
             <tr>
                 <td>${pill(r.status)}</td>
                 <td><div class="ip">${esc(r.server_ip)}</div><div class="host">${esc(r.hostname)}</div></td>
                 <td>${karachi(r.updated_at)}<div class="muted">started ${karachi(r.started_at)}</div></td>
                 <td>${summary(r)}</td>
                 <td><div class="row-actions"><button data-id="${r.id}">View details</button><button title="Copy IP" data-copy="${esc(r.server_ip)}">⧉</button></div></td>
-            </tr>`).join('') : '<tr><td colspan="5" class="empty">No patch runs in this range yet.</td></tr>';
-        document.getElementById('updated').textContent = 'Updated ' + karachi(data.serverTime.replace('T', ' ').slice(0, 19)) + ' · auto-refresh 15s';
-    } catch (e) {
-        document.getElementById('updated').textContent = 'Could not load data, retrying...';
-    }
-    timer = setTimeout(load, 15000);
+            </tr>`).join('') : `<tr><td colspan="5" class="empty">${selected.size && lastRuns.length ? 'No servers with the selected status.' : 'No patch runs in this range yet.'}</td></tr>`;
 }
 
 async function details(id) {
@@ -215,6 +236,17 @@ async function details(id) {
 }
 
 document.getElementById('refresh').onclick = load;
+document.getElementById('cards').addEventListener('click', e => {
+    const card = e.target.closest('.card');
+    if (!card) return;
+    if (card.hasAttribute('data-all')) selected.clear();
+    else selected.has(card.dataset.status) ? selected.delete(card.dataset.status) : selected.add(card.dataset.status);
+    saveFilter();
+    renderRows();
+});
+document.querySelector('.toolbar').addEventListener('click', e => {
+    if (e.target.id === 'clear-filter') { selected.clear(); saveFilter(); renderRows(); }
+});
 document.getElementById('dlg-close').onclick = () => document.getElementById('dlg').close();
 document.getElementById('q').addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(load, 300); });
 document.querySelectorAll('[data-range]').forEach(b => b.onclick = () => {

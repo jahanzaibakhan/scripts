@@ -14,7 +14,7 @@ set -euo pipefail
 APP="${1:?usage: deploy.sh <app_db_name> [--new-secrets]}"
 NEW_SECRETS="${2:-}"
 A="/home/master/applications/${APP}"
-SRC="https://raw.githubusercontent.com/jahanzaibakhan/scripts/main/php-patch-dashboard"
+SRC="https://raw.githubusercontent.com/jahanzaibakhan/scripts/${REF:-main}/php-patch-dashboard"   # REF=<commit> skips raw cache
 FILES=(public_html/index.php public_html/api/report.php public_html/api/runs.php public_html/api/.htaccess private_html/lib.php)
 
 [[ $(id -u) -eq 0 ]] || { echo "Must run as root." >&2; exit 1; }
