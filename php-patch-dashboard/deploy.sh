@@ -35,7 +35,8 @@ echo "Code updated: ${FILES[*]}"
 
 CONFIG="$A/private_html/config.php"
 if [[ ! -f "$CONFIG" || "$NEW_SECRETS" == "--new-secrets" ]]; then
-    db_pass=$(openssl rand -hex 24)
+    # Mixed case, digit and symbol: MariaDB's simple_password_check rejects plain hex.
+    db_pass="Pr-$(openssl rand -hex 24)-X9"
     token=$(openssl rand -hex 32)
     password=$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)
 
