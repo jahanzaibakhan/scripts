@@ -152,9 +152,10 @@ remote_check() {
     for sock in $(grep -ohE '/var/run/fpm-[A-Za-z0-9_.-]+\.sock' "/etc/nginx/sites-available/$app" "/etc/apache2/fcgi/$app.conf" 2>/dev/null | sort -u); do
       [ -S "$sock" ] && continue
       pv=$(grep -h "^$app=" "$fact_dir/applications.fact" 2>/dev/null | cut -d= -f2)
-      perr=$(grep -h "${sock##*/} failed" /home/*/"$app"/logs/*error*.log /var/log/nginx/error.log 2>/dev/null | cut -c1-19 | sort | head -1)
-      [ -z "$perr" ] && perr=$(grep -h "socket $sock .*failed" /var/log/apache2/error.log 2>/dev/null | head -1 \
-        | sed -E 's/^\[[A-Za-z]+ ([A-Za-z]+ [0-9]+ [0-9:]+)\.[0-9]+ ([0-9]+)\].*/\1 \2/')
+      # First "failed" error: nginx logs first, then Apache (AH02454) logs.
+      perr=$(grep -h "${sock##*/}.*failed" /home/*/"$app"/logs/nginx-app.error.log /var/log/nginx/error.log 2>/dev/null | cut -c1-19 | sort | head -1)
+      [ -z "$perr" ] && perr=$(grep -h "${sock##*/}.*failed" /home/*/"$app"/logs/backend_*error.log /var/log/apache2/error.log 2>/dev/null \
+        | sed -nE 's/^\[[A-Za-z]+ ([A-Za-z]+ [0-9]+ [0-9:]+)\.[0-9]+ ([0-9]+)\].*/\2 \1/p' | head -1)
       pdel=$(printf '%s\n' "$j" | grep -E "path=/etc/php/[0-9.]+/fpm/pool.d/$app-[0-9]+\.conf state=absent" | tail -1 | ts)
       echo "A|$app|$sock|${pv:-?}|$perr|$pdel"
     done
