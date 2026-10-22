@@ -1,0 +1,3 @@
+# Let PHP-FPM see the Bearer token (Apache strips Authorization by default).
+CGIPassAuth On
+SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1
