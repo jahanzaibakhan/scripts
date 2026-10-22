@@ -4,10 +4,11 @@
 # Frees disk space, applies the PHP vulnerability fix (patching_php.sh), then
 # verifies the patched php*-fpm packages (version 20261021).
 #
-# Pre-checks run in the terminal (a few seconds): root, no patch already
-# running, Debian 11+, not already patched. Steps 1-4 then run in a detached
-# screen session named "php" (setsid if screen is missing), which closes by
-# itself when done. The full result is written to /var/log/php-patch-summary.log,
+# In the terminal: pre-checks (root, no patch already running, Debian 11+, not
+# already patched), then steps 1-2 and the free-space check, so any reason the
+# patch cannot run is shown right there. Only steps 3-4 (patch, verify) run in a
+# detached screen session named "php" (setsid if screen is missing), which
+# closes by itself when done. The full result is written to /var/log/php-patch-summary.log,
 # ending with one "RESULT: ..." line.
 #
 #  1. Clearing disk space  runs opsgenie/disk-cleanup.sh. If no space is
@@ -62,7 +63,6 @@ human_size() { numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || echo "$1 bytes";
 
 # Size - Used: all unallocated blocks on /, root reservation included.
 physical_free_bytes() { df -PB1 / 2>/dev/null | awk 'NR == 2 { print $2 - $3 }'; }
-available_bytes()     { df -PB1 / 2>/dev/null | awk 'NR == 2 { print $4 }'; }
 
 # patching_php.sh exactly as provided; it logs to /var/log/patching_php.log.
 write_patch_script() {
@@ -410,15 +410,24 @@ refresh_sury_key() {
     fi
 }
 
+# apt runs as root, which may also use the blocks ext4 reserves for root, so
+# count those too (df's Avail column leaves them out).
+check_disk_space() {
+    local free
+    free=$(physical_free_bytes)
+    if (( free < MIN_FREE_BYTES )); then
+        fail "Not enough disk space: only $(human_size "$free") free on / after cleanup, apt needs at least $(human_size "$MIN_FREE_BYTES"). Patching not started - free up space and rerun."
+        write_result FAILED "low_disk free=$(human_size "$free")"
+        exit 1
+    fi
+    ok "Disk space OK for apt: $(human_size "$free") free on /."
+}
+
 run_patch() {
     local pid rc last line elapsed=0
     status "[3/4] Now running patching..."
 
-    # Patch even when nothing was cleared, as long as apt has room to work.
-    if (( $(available_bytes) < MIN_FREE_BYTES )); then
-        fail "Only $(human_size "$(available_bytes)") available on /, need $(human_size "$MIN_FREE_BYTES") for apt. Patching not started."
-        exit 1
-    fi
+    check_disk_space
 
     write_patch_script
     : >> "$PATCH_LOG"
@@ -525,7 +534,7 @@ write_result() {
     fi
 }
 
-# On exit of run_all: make sure a RESULT line exists, then let the log copier finish
+# On exit: make sure a RESULT line exists, then let the log copier finish
 # before the screen closes (it would otherwise be cut off by the hangup).
 finish_run() {
     [[ -n "$RESULT" ]] || write_result FAILED "see $PATCH_LOG"
@@ -581,32 +590,36 @@ preflight() {
     fi
 }
 
-# Steps 1-4. Everything printed also goes to the summary log (colours stripped).
-run_all() {
-    local patch_rc
+# $1: seconds to wait for the lock (the background run waits for the terminal run to let go).
+hold_run_lock() {
     exec 8>"$RUN_LOCK"
-    if ! flock -n 8; then
+    if ! flock -w "${1:-0}" 8; then
         fail "php-patch-with-cleanup.sh is already running on this server."
         exit 1
     fi
+}
 
+# From here on, everything printed also goes to the summary log (colours stripped).
+start_summary_copy() {
     SPIN=""
     if [[ -t 1 ]]; then
         exec 3>&1
         SPIN=1
     fi
     # One copier process: line to the terminal as is, and to the summary without colours.
-    exec > >(while IFS= read -r line || [[ -n "$line" ]]; do
+    # It must not hold the run lock (fd 8), or the background run could not take it.
+    exec > >(exec 8>&-; while IFS= read -r line || [[ -n "$line" ]]; do
         printf '%s\n' "$line"
         printf '%s\n' "$line" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' >> "$SUMMARY_LOG"
     done) 2>&1
     OUT_PID=$!
     IN_RUN=1
     trap finish_run EXIT
-    status "Started $(date '+%Y-%m-%d %H:%M:%S %Z') on $(hostname)"
+}
 
-    clear_disk_space
-    refresh_sury_key
+# Steps 3-4, then the RESULT line.
+patch_and_verify() {
+    local patch_rc
     run_patch
     patch_rc=$?
 
@@ -620,18 +633,26 @@ run_all() {
     exit 1
 }
 
-# Writes this script's variables and functions to a file and runs run_all from
-# it in the background. Needed because under curl | bash there is no file to rerun.
+# Entry point of the generated background script.
+run_background() {
+    hold_run_lock 30
+    start_summary_copy
+    status "Patch started in the background $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    patch_and_verify
+}
+
+# Writes this script's variables and functions to a file and runs run_background
+# from it in the background. Needed because under curl | bash there is no file to rerun.
 start_background() {
     {
         echo '#!/usr/bin/env bash'
-        echo '# Generated by php-patch-with-cleanup.sh; runs steps 1-4.'
+        echo '# Generated by php-patch-with-cleanup.sh; runs steps 3-4 (patch, verify).'
         echo 'set -o pipefail'
         declare -p CLEANUP_URL CLEANUP_LOG PATCH_SCRIPT PATCH_LOG PATCH_LOCK PATCH_VERSION \
             SUMMARY_LOG RUN_SCRIPT RUN_LOCK SCREEN_NAME MIN_FREED_BYTES MIN_FREE_BYTES \
             SURY_KEY_URL SURY_FPR C_RESET C_BOLD C_RED C_GREEN C_YELLOW C_CYAN
         declare -f
-        echo 'run_all'
+        echo 'run_background'
     } > "$RUN_SCRIPT"
     chmod 700 "$RUN_SCRIPT"
     if ! bash -n "$RUN_SCRIPT"; then
@@ -639,18 +660,21 @@ start_background() {
         exit 1
     fi
 
-    status "Starting cleanup, key check, patch and verify in the background..."
+    status "All checks passed, starting patch and verify in the background..."
+    # The background run waits for our lock, which we hold until our last line is
+    # in the summary (released on exit). Keep it and our output pipe off the child.
     if command -v screen >/dev/null 2>&1; then
-        screen -dmS "$SCREEN_NAME" bash "$RUN_SCRIPT"
+        screen -dmS "$SCREEN_NAME" bash "$RUN_SCRIPT" < /dev/null > /dev/null 2>&1 3>&- 8>&-
         ok "Started in screen '${SCREEN_NAME}'. It closes by itself when done."
         echo "  Watch live:   screen -r ${SCREEN_NAME}   (detach again: Ctrl+A then D)"
     else
-        setsid bash "$RUN_SCRIPT" < /dev/null > /dev/null 2>&1 &
+        setsid bash "$RUN_SCRIPT" < /dev/null > /dev/null 2>&1 3>&- 8>&- &
         ok "Started in the background (screen is not installed)."
     fi
     echo "  Progress:     tail -f $PATCH_LOG"
     echo "  Result:       cat $SUMMARY_LOG   (last line: RESULT: PATCHED / FAILED ...)"
     echo "You can close this session now."
+    RESULT=BACKGROUND     # the background run writes the RESULT line
 }
 
 main() {
@@ -663,8 +687,15 @@ main() {
     fi
 
     preflight
+    hold_run_lock
+    start_summary_copy
+    status "Started $(date '+%Y-%m-%d %H:%M:%S %Z') on $(hostname)"
+    clear_disk_space
+    refresh_sury_key
+    check_disk_space
+
     if [[ "$foreground" == true ]]; then
-        run_all
+        patch_and_verify
     fi
     start_background
 }
