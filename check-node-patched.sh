@@ -6,15 +6,18 @@
 # Patched: 22.23.4 / 24.22.1 / 26.12.1 (official NVM builds)
 #          20.20.2-14 / 18.20.8-26 / 14.21.3-35 (TuxCare ELTS)
 #
-# Run as platformops or root:  sudo -u platformops bash check-node-patched.sh  |  sudo bash check-node-patched.sh
+# Run as platformops, root or the Cloudways master user (master_*):
+#   platformops / root : full install + default check; root also sees every process
+#   master_*           : sees its own processes, so PM2 apps under master are visible
 # Exit codes: 0 = all good, 1 = vulnerable process running, 3 = unverified / vulnerable
 #             installs only, 2 = wrong user. Set NO_COLOR=1 to disable colors.
 
 set -u
 
-case "$(id -un)" in
-  platformops|root) ;;
-  *) echo "ERROR: run this as platformops or root:  sudo -u platformops bash $0  |  sudo bash $0" >&2; exit 2 ;;
+ME=$(id -un)
+case "$ME" in
+  platformops|root|master_*) ;;
+  *) echo "ERROR: run this as platformops, root or the master_* user" >&2; exit 2 ;;
 esac
 
 # ---------- colors ----------
@@ -86,7 +89,7 @@ BAD_RUN=0; WARN=0
 INST=""   # newline list of "major version" for every nvm install found
 
 printf '%s%s%s\n' "$B" "Node.js patch check  |  host: $(hostname)  |  $(date -u +%FT%TZ)  |  user: $(id -un)" "$N"
-[ -z "$SUDO" ] && [ "$(id -u)" -ne 0 ] && printf '%sNote: passwordless sudo not available - other users'"'"' files/processes may be hidden%s\n' "$Y" "$N"
+[ -z "$SUDO" ] && [ "$ME" = platformops ] && printf '%sNote: passwordless sudo not available - other users'"'"' files/processes may be hidden%s\n' "$Y" "$N"
 
 # ---------- installed (nvm) ----------
 head1 "1. Installed Node versions (nvm)"
@@ -132,7 +135,12 @@ printf '%s%-11s %-12s %-8s %-14s %-24s %s%s\n' "$B" STATUS USER PID RUNNING "PAT
 any=0; seen=" "
 # Can this account see other users' processes? (hidepid hides them: pid 1 is then invisible)
 blind=0
-if [ "$(id -u)" -ne 0 ] && [ -z "$SUDO" ] && [ -z "$(ps -p 1 -o pid= 2>/dev/null)" ]; then blind=1; fi
+if [ "$(id -u)" -ne 0 ] && [ -z "$SUDO" ] && [ -z "$(ps -p 1 -o pid= 2>/dev/null)" ]; then
+  case "$ME" in
+    master_*) printf '%sShowing processes owned by %s only (other users are hidden by the OS).%s\n' "$D" "$ME" "$N" ;;
+    *) blind=1 ;;
+  esac
+fi
 
 show_proc() {
   local pid=$1 exe v st usr cmd
@@ -177,11 +185,64 @@ if [ "$blind" -eq 1 ]; then
       printf '  %sapps/interpreter version unreadable from this account%s\n' "$Y" "$N"
     fi
   done
-  printf '%sFor a definitive result re-run as root:  curl -fsSL https://raw.githubusercontent.com/jahanzaibakhan/scripts/main/check-node-patched.sh | sudo bash%s\n' "$Y" "$N"
+  printf '%sFor a definitive result re-run as root or as the master_* user:  curl -fsSL https://raw.githubusercontent.com/jahanzaibakhan/scripts/main/check-node-patched.sh | sudo bash%s\n' "$Y" "$N"
 elif [ "$any" -eq 0 ]; then
   printf '%sNo node processes found (visibility is full, so none appear to be running).%s\n' "$Y" "$N"
   WARN=1
 fi
+
+# ---------- PM2 apps ----------
+# Ask each live PM2 daemon for its app list. Only possible as the daemon owner or root.
+pm2_jlist() {   # $1 = owner, $2 = PM2_HOME
+  local owner=$1 home=$2 bin dir
+  bin=$(ls -1 "$(dirname "$home")"/.nvm/versions/node/*/bin/pm2 2>/dev/null | sort -V | tail -n1)
+  [ -n "$bin" ] || bin=$(command -v pm2 2>/dev/null)
+  [ -n "$bin" ] || return 1
+  dir=$(dirname "$bin")
+  if [ "$ME" = "$owner" ]; then
+    PM2_HOME="$home" PATH="$dir:$PATH" "$bin" jlist 2>/dev/null
+  elif [ "$(id -u)" -eq 0 ]; then
+    runuser -u "$owner" -- env HOME="$(dirname "$home")" PM2_HOME="$home" PATH="$dir:$PATH" "$bin" jlist 2>/dev/null
+  else
+    return 1
+  fi | PATH="$dir:$PATH" node -e '
+    let s = require("fs").readFileSync(0, "utf8"); const i = s.indexOf("[");
+    if (i < 0) process.exit(1);
+    for (const p of JSON.parse(s.slice(i))) {
+      const e = p.pm2_env || {};
+      console.log([p.name, p.pid || 0, e.status || "?", e.exec_interpreter || "node", e.node_version || "?"].join("\t"));
+    }' 2>/dev/null
+}
+
+pm2_shown=0
+for pf in /home/*/.pm2/pm2.pid; do
+  [ -r "$pf" ] || continue
+  dp=$(cat "$pf" 2>/dev/null); [ -n "$dp" ] || continue
+  case "$(kill -0 "$dp" 2>&1)" in *"No such process"*) continue ;; esac
+  owner=$(stat -c %U "$pf" 2>/dev/null || stat -f %Su "$pf" 2>/dev/null)
+  [ "$ME" = "$owner" ] || [ "$(id -u)" -eq 0 ] || continue
+  if [ "$pm2_shown" -eq 0 ]; then
+    head1 "3b. PM2 apps (interpreter each app actually runs on)"
+    printf '%s%-11s %-18s %-8s %-9s %-14s %-24s %s%s\n' "$B" STATUS APP PID STATE RUNNING "PATCHED VERSION" INTERPRETER "$N"
+    pm2_shown=1
+  fi
+  out=$(pm2_jlist "$owner" "$(dirname "$pf")")
+  if [ -z "$out" ]; then
+    printf '%sPM2 daemon %s (owner %s): app list unavailable (pm2/node not found or no apps)%s\n' "$Y" "$dp" "$owner" "$N"
+    continue
+  fi
+  while IFS=$'\t' read -r name apid state interp nv; do
+    v=""
+    if [ "$apid" != 0 ]; then
+      exe=$($SUDO readlink "/proc/$apid/exe" 2>/dev/null) && v=$($SUDO "$exe" -v 2>/dev/null)
+    fi
+    if [ -z "$v" ] && [ -x "$interp" ]; then v=$("$interp" -v 2>/dev/null); fi
+    [ -n "$v" ] || v="v${nv#v}"
+    st=$(classify "$v")
+    [ "$st" = VULNERABLE ] && [ "$state" = online ] && BAD_RUN=1
+    printf '%s %-18s %-8s %-9s %-14s %-24s %s\n' "$(badge "$st")" "${name:0:18}" "$apid" "$state" "$v" "$(need_for "$v")" "$interp"
+  done <<< "$out"
+done
 
 # ---------- patched availability ----------
 head1 "4. Is a patched build installed? (per major line found above)"
@@ -211,7 +272,7 @@ elif [ "$BAD_RUN" -eq 2 ]; then
   printf '  Re-run as root to confirm. Fix: nvm use <patched-version> ; pm2 restart all --interpreter <patched-version> ; pm2 save\n'
   rc=1
 elif [ "$blind" -eq 1 ]; then
-  printf '%s%s VERDICT: INCOMPLETE - cannot see other users'"'"' processes as %s. Re-run as root.%s\n' "$B" "$Y" "$(id -un)" "$N"
+  printf '%s%s VERDICT: INCOMPLETE - cannot see other users'"'"' processes as %s. Re-run as root or the master_* user.%s\n' "$B" "$Y" "$(id -un)" "$N"
   rc=3
 elif [ "$WARN" -eq 1 ]; then
   printf '%s%s VERDICT: NOT VERIFIED PATCHED - no vulnerable process seen, but vulnerable/missing versions are installed or default.%s\n' "$B" "$Y" "$N"
