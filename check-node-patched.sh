@@ -35,17 +35,38 @@ ver_ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]; }  
 
 # Prints: PATCHED | VULNERABLE | VERIFY-ELTS | UNKNOWN
 classify() {
-  local v="${1#v}" major
+  local v="${1#v}" major sfx build
+  sfx=""; case "$v" in *-*) sfx="${v#*-}";; esac
   v="${v%%-*}"; major="${v%%.*}"
   if [ -n "$(min_for "$major")" ]; then
     ver_ge "$v" "$(min_for "$major")" && echo PATCHED || echo VULNERABLE
   elif [ -n "$(elts_for "$major")" ]; then
-    # node -v cannot show the TuxCare build number (-14/-26/-35), so base >= is only "needs check"
-    ver_ge "$v" "$(elts_for "$major")" && echo VERIFY-ELTS || echo VULNERABLE
+    # TuxCare ELTS build number (-14/-26/-35) is only visible if it is in the version string/dir name
+    if ! ver_ge "$v" "$(elts_for "$major")"; then echo VULNERABLE
+    else
+      build="${sfx##*[!0-9]}"
+      if [ -n "$build" ]; then
+        [ "$build" -ge "$(elts_full_for "$major" | sed 's/.*-//')" ] && echo PATCHED || echo VULNERABLE
+      else
+        echo VERIFY-ELTS
+      fi
+    fi
   elif [ "$major" -gt 26 ] 2>/dev/null; then
     echo UNKNOWN
   else
     echo VULNERABLE   # EOL / unpatched line (25.x, 23.x, <14, ...)
+  fi
+}
+
+# Patched version required for a given major (shown next to every installed/running version)
+need_for() {
+  local m="${1#v}"; m="${m%%.*}"
+  if [ -n "$(min_for "$m")" ]; then echo "$(min_for "$m")"
+  elif [ -n "$(elts_for "$m")" ]; then echo "$(elts_full_for "$m") (ELTS)"
+  elif [ "$m" = 25 ]; then echo "upgrade -> 26.12.1"
+  elif [ "$m" = 23 ]; then echo "upgrade -> 24.22.1"
+  elif [ "$m" -gt 26 ] 2>/dev/null; then echo "n/a"
+  else echo "upgrade -> 22.23.4"
   fi
 }
 
@@ -69,7 +90,7 @@ printf '%s%s%s\n' "$B" "Node.js patch check  |  host: $(hostname)  |  $(date -u 
 
 # ---------- installed (nvm) ----------
 head1 "1. Installed Node versions (nvm)"
-printf '%s%-11s %-10s %s%s\n' "$B" STATUS VERSION PATH "$N"
+printf '%s%-11s %-14s %-24s %s%s\n' "$B" STATUS INSTALLED "PATCHED VERSION" PATH "$N"
 nvm_dirs=$($SUDO find /home /usr/local /opt -maxdepth 2 \( -name .nvm -o -name nvm \) -type d 2>/dev/null)
 found=0
 for d in $nvm_dirs; do
@@ -77,7 +98,7 @@ for d in $nvm_dirs; do
     [ -e "$n" ] || continue
     found=1
     v=$(basename "$(dirname "$(dirname "$n")")")
-    printf '%s %-10s %s\n' "$(badge "$(classify "$v")")" "$v" "$n"
+    printf '%s %-14s %-24s %s\n' "$(badge "$(classify "$v")")" "$v" "$(need_for "$v")" "$n"
     m=${v#v}; m=${m%%.*}
     INST="$INST$m ${v#v}"$'\n'
   done
@@ -89,7 +110,7 @@ head1 "2. Default Node (what a new shell / restart without 'nvm use' picks up)"
 sys=$(command -v node 2>/dev/null)
 if [ -n "$sys" ]; then
   sv=$($sys -v); st=$(classify "$sv")
-  printf '%s %-10s %s %s(PATH default)%s\n' "$(badge "$st")" "$sv" "$sys" "$D" "$N"
+  printf '%s %-14s %-24s %s %s(PATH default)%s\n' "$(badge "$st")" "$sv" "$(need_for "$sv")" "$sys" "$D" "$N"
   [ "$st" = VULNERABLE ] && WARN=1
 fi
 for d in $nvm_dirs; do
@@ -98,16 +119,16 @@ for d in $nvm_dirs; do
   # alias may be a major ("20"), "lts/*", or a full version; resolve to newest matching install
   res=$(ls -1 "$d/versions/node" 2>/dev/null | sed 's/^v//' | grep -E "^${a#v}(\.|$)" | sort -V | tail -n1)
   if [ -n "$res" ]; then
-    st=$(classify "$res"); printf '%s %-10s %s %s(nvm alias default -> %s)%s\n' "$(badge "$st")" "v$res" "$d" "$D" "$a" "$N"
+    st=$(classify "$res"); printf '%s %-14s %-24s %s %s(nvm alias default -> %s)%s\n' "$(badge "$st")" "v$res" "$(need_for "$res")" "$d" "$D" "$a" "$N"
     [ "$st" = VULNERABLE ] && WARN=1
   else
-    printf '%s %-10s %s %s(nvm alias default -> %s, unresolved)%s\n' "$(badge UNKNOWN)" "?" "$d" "$D" "$a" "$N"
+    printf '%s %-14s %-24s %s %s(nvm alias default -> %s, unresolved)%s\n' "$(badge UNKNOWN)" "?" "-" "$d" "$D" "$a" "$N"
   fi
 done
 
 # ---------- running ----------
 head1 "3. Running Node processes (these are what the patch must actually reach)"
-printf '%s%-11s %-12s %-8s %-10s %s%s\n' "$B" STATUS USER PID VERSION COMMAND "$N"
+printf '%s%-11s %-12s %-8s %-14s %-24s %s%s\n' "$B" STATUS USER PID RUNNING "PATCHED VERSION" COMMAND "$N"
 any=0
 for pid in $(pgrep -x node 2>/dev/null) $(pgrep -f 'PM2.*God Daemon' 2>/dev/null); do
   exe=$($SUDO readlink "/proc/$pid/exe" 2>/dev/null) || continue
@@ -118,7 +139,7 @@ for pid in $(pgrep -x node 2>/dev/null) $(pgrep -f 'PM2.*God Daemon' 2>/dev/null
   [ "$st" = VULNERABLE ] && BAD_RUN=1
   usr=$(ps -o user= -p "$pid" 2>/dev/null)
   cmd=$(ps -o args= -p "$pid" 2>/dev/null | cut -c1-60)
-  printf '%s %-12s %-8s %-10s %s\n' "$(badge "$st")" "$usr" "$pid" "$v" "$cmd"
+  printf '%s %-12s %-8s %-14s %-24s %s\n' "$(badge "$st")" "$usr" "$pid" "$v" "$(need_for "$v")" "$cmd"
 done
 if [ "$any" -eq 0 ]; then
   printf '%sNo node processes visible to %s.%s\n' "$Y" "$(id -un)" "$N"
@@ -132,20 +153,18 @@ fi
 
 # ---------- patched availability ----------
 head1 "4. Is a patched build installed? (per major line found above)"
-printf '%s%-7s %-22s %-14s %s%s\n' "$B" LINE REQUIRED "BEST INSTALLED" RESULT "$N"
+printf '%s%-7s %-24s %-14s %s%s\n' "$B" LINE "PATCHED VERSION" "BEST INSTALLED" RESULT "$N"
 majors=$(printf '%s' "$INST" | awk 'NF{print $1}' | sort -un)
 for m in $majors; do
   best=$(printf '%s' "$INST" | awk -v m="$m" '$1==m{print $2}' | sort -V | tail -n1)
-  if [ -n "$(min_for "$m")" ]; then
-    req=$(min_for "$m")
-    if ver_ge "$best" "$req"; then res="${G}OK - patched build present${N}"; else res="${R}MISSING - install ${req}${N}"; WARN=1; fi
-  elif [ -n "$(elts_for "$m")" ]; then
-    req="$(elts_full_for "$m") (ELTS)"
-    if ver_ge "$best" "$(elts_for "$m")"; then res="${Y}base ok - confirm ELTS build${N}"; else res="${R}MISSING - needs TuxCare ELTS $(elts_full_for "$m")${N}"; WARN=1; fi
-  else
-    req="EOL - no patch"; res="${R}UNPATCHED LINE - move to 22/24/26${N}"; WARN=1
-  fi
-  printf '%-7s %-22s %-14s %s\n' "${m}.x" "$req" "v${best}" "$res"
+  req=$(need_for "$m")
+  case "$(classify "$best")" in
+    PATCHED)     res="${G}OK - patched build present${N}" ;;
+    VERIFY-ELTS) res="${Y}base ok - confirm TuxCare ELTS build${N}" ;;
+    UNKNOWN)     res="${Y}newer than known list${N}" ;;
+    *)           res="${R}MISSING - no patched build installed${N}"; WARN=1 ;;
+  esac
+  printf '%-7s %-24s %-14s %s\n' "${m}.x" "$req" "v${best}" "$res"
 done
 [ -z "$majors" ] && printf '%s(nothing to evaluate)%s\n' "$D" "$N"
 
