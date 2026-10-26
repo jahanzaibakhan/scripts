@@ -129,10 +129,17 @@ done
 # ---------- running ----------
 head1 "3. Running Node processes (these are what the patch must actually reach)"
 printf '%s%-11s %-12s %-8s %-14s %-24s %s%s\n' "$B" STATUS USER PID RUNNING "PATCHED VERSION" COMMAND "$N"
-any=0
-for pid in $(pgrep -x node 2>/dev/null) $(pgrep -f 'PM2.*God Daemon' 2>/dev/null); do
-  exe=$($SUDO readlink "/proc/$pid/exe" 2>/dev/null) || continue
-  [ -n "$exe" ] || continue
+any=0; seen=" "
+# Can this account see other users' processes? (hidepid hides them: pid 1 is then invisible)
+blind=0
+if [ "$(id -u)" -ne 0 ] && [ -z "$SUDO" ] && [ -z "$(ps -p 1 -o pid= 2>/dev/null)" ]; then blind=1; fi
+
+show_proc() {
+  local pid=$1 exe v st usr cmd
+  case "$seen" in *" $pid "*) return ;; esac
+  seen="$seen$pid "
+  exe=$($SUDO readlink "/proc/$pid/exe" 2>/dev/null) || return
+  case "$(basename "${exe:-x}")" in node*) ;; *) return ;; esac
   any=1
   v=$($SUDO "$exe" -v 2>/dev/null); [ -n "$v" ] || v="?"
   st=$(classify "$v")
@@ -140,14 +147,39 @@ for pid in $(pgrep -x node 2>/dev/null) $(pgrep -f 'PM2.*God Daemon' 2>/dev/null
   usr=$(ps -o user= -p "$pid" 2>/dev/null)
   cmd=$(ps -o args= -p "$pid" 2>/dev/null | cut -c1-60)
   printf '%s %-12s %-8s %-14s %-24s %s\n' "$(badge "$st")" "$usr" "$pid" "$v" "$(need_for "$v")" "$cmd"
+}
+
+daemons=$(pgrep -f 'PM2.*God Daemon' 2>/dev/null)
+for pid in $(pgrep -x node 2>/dev/null) $daemons; do show_proc "$pid"; done
+for dp in $daemons; do                       # PM2-managed apps are children of the daemon
+  for c in $(pgrep -P "$dp" 2>/dev/null); do show_proc "$c"; done
 done
-if [ "$any" -eq 0 ]; then
-  printf '%sNo node processes visible to %s.%s\n' "$Y" "$(id -un)" "$N"
-  if grep -q 'hidepid=[12]' /proc/mounts 2>/dev/null && [ -z "$SUDO" ]; then
-    printf '%s/proc is mounted with hidepid and no sudo: other users'"'"' processes are hidden, so this does NOT prove nothing is running.%s\n' "$Y" "$N"
-  else
-    printf '%sEither no Node app is running, or it runs under another user - check with: ps aux | grep -i [n]ode ; pm2 ls (as the app user)%s\n' "$D" "$N"
-  fi
+
+if [ "$blind" -eq 1 ]; then
+  WARN=1
+  printf '%sBLIND SPOT: as %s (no sudo) other users'"'"' processes are hidden by the OS, so the list above is NOT complete.%s\n' "$R" "$(id -un)" "$N"
+  printf '%sBest-effort probe of PM2 homes (daemon liveness via pid file, versions inferred from the saved PM2 env):%s\n' "$Y" "$N"
+  for pf in /home/*/.pm2/pm2.pid; do
+    [ -r "$pf" ] || continue
+    dp=$(cat "$pf" 2>/dev/null); [ -n "$dp" ] || continue
+    owner=$(stat -c %U "$pf" 2>/dev/null || stat -f %Su "$pf" 2>/dev/null)
+    case "$(kill -0 "$dp" 2>&1)" in *"No such process"*) state="stopped" ;; *) state="ALIVE" ;; esac
+    printf '  PM2 daemon pid %s owner %s: %s\n' "$dp" "$owner" "$state"
+    [ "$state" = ALIVE ] || continue
+    dump="$(dirname "$pf")/dump.pm2"
+    vs=$([ -r "$dump" ] && grep -oE 'versions/node/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?' "$dump" | sed 's#.*/##' | sort -uV)
+    if [ -n "$vs" ]; then
+      for v in $vs; do
+        st=$(classify "$v"); [ "$st" = VULNERABLE ] && [ "$BAD_RUN" -eq 0 ] && BAD_RUN=2
+        printf '  %s %-14s %-24s %s(inferred from %s)%s\n' "$(badge "$st")" "$v" "$(need_for "$v")" "$D" "$dump" "$N"
+      done
+    else
+      printf '  %sapps/interpreter version unreadable from this account%s\n' "$Y" "$N"
+    fi
+  done
+  printf '%sFor a definitive result re-run as root:  curl -fsSL https://raw.githubusercontent.com/jahanzaibakhan/scripts/main/check-node-patched.sh | sudo bash%s\n' "$Y" "$N"
+elif [ "$any" -eq 0 ]; then
+  printf '%sNo node processes found (visibility is full, so none appear to be running).%s\n' "$Y" "$N"
   WARN=1
 fi
 
@@ -174,9 +206,15 @@ if [ "$BAD_RUN" -eq 1 ]; then
   printf '%s%s VERDICT: VULNERABLE - a running Node process uses an unpatched version.%s\n' "$B" "$R" "$N"
   printf '  Fix: nvm use <patched-version> ; pm2 restart all --interpreter <patched-version> ; pm2 save\n'
   rc=1
+elif [ "$BAD_RUN" -eq 2 ]; then
+  printf '%s%s VERDICT: LIKELY VULNERABLE - PM2 is alive and its saved env points to an unpatched Node (inferred).%s\n' "$B" "$R" "$N"
+  printf '  Re-run as root to confirm. Fix: nvm use <patched-version> ; pm2 restart all --interpreter <patched-version> ; pm2 save\n'
+  rc=1
+elif [ "$blind" -eq 1 ]; then
+  printf '%s%s VERDICT: INCOMPLETE - cannot see other users'"'"' processes as %s. Re-run as root.%s\n' "$B" "$Y" "$(id -un)" "$N"
+  rc=3
 elif [ "$WARN" -eq 1 ]; then
-  printf '%s%s VERDICT: NOT VERIFIED PATCHED - no vulnerable process was seen, but see warnings above%s\n' "$B" "$Y" "$N"
-  printf '  (no visible running processes, and/or vulnerable/missing versions are installed or set as default)\n'
+  printf '%s%s VERDICT: NOT VERIFIED PATCHED - no vulnerable process seen, but vulnerable/missing versions are installed or default.%s\n' "$B" "$Y" "$N"
   rc=3
 else
   printf '%s%s VERDICT: PATCHED - all running and default Node versions are patched.%s\n' "$B" "$G" "$N"
