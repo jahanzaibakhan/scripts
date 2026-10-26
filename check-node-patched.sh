@@ -6,16 +6,16 @@
 # Patched: 22.23.4 / 24.22.1 / 26.12.1 (official NVM builds)
 #          20.20.2-14 / 18.20.8-26 / 14.21.3-35 (TuxCare ELTS)
 #
-# Must be run as platformops:  sudo -u platformops bash check-node-patched.sh
+# Run as platformops or root:  sudo -u platformops bash check-node-patched.sh  |  sudo bash check-node-patched.sh
 # Exit codes: 0 = all good, 1 = vulnerable process running, 3 = unverified / vulnerable
 #             installs only, 2 = wrong user. Set NO_COLOR=1 to disable colors.
 
 set -u
 
-if [ "$(id -un)" != "platformops" ]; then
-  echo "ERROR: run this as the platformops user:  sudo -u platformops bash $0" >&2
-  exit 2
-fi
+case "$(id -un)" in
+  platformops|root) ;;
+  *) echo "ERROR: run this as platformops or root:  sudo -u platformops bash $0  |  sudo bash $0" >&2; exit 2 ;;
+esac
 
 # ---------- colors ----------
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] || [ -n "${FORCE_COLOR:-}" ]; then
