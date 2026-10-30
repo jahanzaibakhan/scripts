@@ -12,6 +12,9 @@
 # so ai-bolit package updates do not undo it. Every run regenerates the
 # copy from the current packaged launcher and reports if it has drifted.
 #
+# resident_ram is also set to 1024 (2048 on --revert) so `config show`
+# agrees with the running scanner, even though the scanner ignores it.
+#
 # If the scanner does not come back up with the new limit, the drop-in is
 # removed and the original launcher restored automatically.
 #
@@ -25,6 +28,9 @@
 set -uo pipefail
 
 NEW_MEM="1G"
+NEW_RAM_MB=1024
+DEFAULT_RAM_MB=2048
+MERGED_CONF="/etc/sysconfig/imunify360/imunify360-merged.config"
 UNIT="aibolit-resident.service"
 SOCKET="aibolit-resident.socket"
 LAUNCHER="/opt/ai-bolit/aibolit-resident-launcher.sh"
@@ -54,6 +60,12 @@ mem_c() {
   fi
 }
 state_c() { [[ "$1" == active ]] && echo "${G}$1${N}" || echo "${R}$1${N}"; }
+ram_c() {
+  if [[ -z "$1" ]]; then echo "${Y}n/a${N}"
+  elif [[ "$1" == "$NEW_RAM_MB" ]]; then echo "${G}$1${N}"
+  else echo "${R}$1${N}"
+  fi
+}
 
 MODE=apply
 ASSUME_YES=0
@@ -62,7 +74,7 @@ for arg in "$@"; do
     --check|-c)  MODE=check ;;
     --revert|-r) MODE=revert ;;
     --yes|-y)    ASSUME_YES=1 ;;
-    -h|--help)   sed -n '2,23p' "$0" 2>/dev/null; exit 0 ;;
+    -h|--help)   sed -n '2,26p' "$0" 2>/dev/null; exit 0 ;;
     *) die "Unknown option: $arg (use --check, --yes, --revert or --help)" ;;
   esac
 done
@@ -78,6 +90,30 @@ resident_mem() {
   pid="$(systemctl show -p MainPID --value "$UNIT" 2>/dev/null)"
   [[ -n "$pid" && "$pid" != 0 && -r /proc/$pid/cmdline ]] || return 0
   tr '\0' '\n' < "/proc/$pid/cmdline" | sed -n 's/^--memory=//p' | head -n1
+}
+
+# Imunify360 ships imunify360-agent, ImunifyAV ships imunify-antivirus.
+AGENT_CLI="$(command -v imunify360-agent || command -v imunify-antivirus || true)"
+
+# MALWARE_SCAN_INTENSITY.resident_ram from the merged config, or empty.
+config_ram() {
+  sed -n 's/^ *resident_ram: *\([0-9]*\).*/\1/p' "$MERGED_CONF" 2>/dev/null | head -n1
+}
+
+set_config_ram() {
+  local mb="$1"
+  if [[ -z "$AGENT_CLI" ]]; then
+    warn "imunify360-agent / imunify-antivirus not found; config resident_ram not changed."
+    return 0
+  fi
+  if "$AGENT_CLI" config update "{\"MALWARE_SCAN_INTENSITY\":{\"resident_ram\":$mb}}" >/dev/null 2>&1; then
+    # The merged config file can lag the CLI by a moment.
+    local i
+    for ((i = 0; i < 10; i++)); do [[ "$(config_ram)" == "$mb" ]] && break; sleep 1; done
+    ok "config resident_ram set to $mb"
+  else
+    warn "could not set config resident_ram to $mb (the scanner limit itself is unaffected)."
+  fi
 }
 
 # Top Imunify / malware-scan processes by memory.
@@ -104,6 +140,7 @@ report() {
   echo "Resident scanner ($UNIT): $(state_c "$state")"
   echo "Current --memory limit           : $(mem_c "$cur")"
   echo "Packaged launcher limit          : $(grep -m1 -o -- '^--memory=[^ ]*' "$LAUNCHER" | cut -d= -f2)"
+  echo "Config resident_ram (MB)         : $(ram_c "$(config_ram)")"
   if [[ -f "$DROPIN" ]]; then
     echo "Override drop-in                 : ${G}present${N} ($DROPIN)"
     if [[ -f "$OVR_SRC_SUM" ]] && ! sha256sum --quiet -c "$OVR_SRC_SUM" >/dev/null 2>&1; then
@@ -152,6 +189,8 @@ verify_hint() {
   systemctl is-active aibolit-resident.service aibolit-resident.socket
   systemctl cat aibolit-resident.service | grep '^ExecStart'
 EOF
+  [[ -n "$AGENT_CLI" ]] && echo "  $(basename "$AGENT_CLI") config show | python3 -m json.tool | grep resident_ram"
+  return 0
 }
 
 report
@@ -174,6 +213,7 @@ if [[ "$MODE" == revert ]]; then
   else
     die "$UNIT did not come back with --memory=$PKG_MEM. Check: journalctl -u $UNIT -n 30"
   fi
+  set_config_ram "$DEFAULT_RAM_MB"
   show_processes
   verify_hint
   exit 0
@@ -186,6 +226,7 @@ fi
 if [[ -f "$DROPIN" && "$(resident_mem)" == "$NEW_MEM" ]] \
    && sha256sum --quiet -c "$OVR_SRC_SUM" >/dev/null 2>&1; then
   ok "already applied - resident scanner is running with --memory=$NEW_MEM."
+  [[ "$(config_ram)" == "$NEW_RAM_MB" ]] || set_config_ram "$NEW_RAM_MB"
   verify_hint
   exit 0
 fi
@@ -221,6 +262,7 @@ info "Restarting $UNIT (waiting up to ${WAIT_SECS}s) ..."
 restart_resident
 if wait_for "$NEW_MEM"; then
   ok "resident scanner running with --memory=$NEW_MEM"
+  set_config_ram "$NEW_RAM_MB"
 else
   warn "$UNIT did not come up with --memory=$NEW_MEM - rolling back to the packaged launcher."
   journalctl -u "$UNIT" -n 10 --no-pager 2>/dev/null | sed 's/^/   /'
@@ -237,4 +279,5 @@ show_processes
 echo "Resident scanner ($UNIT): $(state_c "$(systemctl is-active "$UNIT")")"
 echo "Socket ($SOCKET)        : $(state_c "$(systemctl is-active "$SOCKET")")"
 echo "New --memory limit      : $(mem_c "$(resident_mem)")"
+echo "Config resident_ram (MB): $(ram_c "$(config_ram)")"
 verify_hint
