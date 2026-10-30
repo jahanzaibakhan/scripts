@@ -45,6 +45,16 @@ info() { echo "${B}==${N} $*"; }
 ok()   { echo "${G}OK:${N} $*"; }
 warn() { echo "${Y}WARN:${N} $*"; }
 
+# Green when the limit is the target, red when it is anything else,
+# yellow when the scanner is not running.
+mem_c() {
+  if [[ -z "$1" ]]; then echo "${Y}n/a (not running)${N}"
+  elif [[ "$1" == "$NEW_MEM" ]]; then echo "${G}$1${N}"
+  else echo "${R}$1${N}"
+  fi
+}
+state_c() { [[ "$1" == active ]] && echo "${G}$1${N}" || echo "${R}$1${N}"; }
+
 MODE=apply
 ASSUME_YES=0
 for arg in "$@"; do
@@ -91,16 +101,16 @@ report() {
   local cur state
   cur="$(resident_mem)"
   state="$(systemctl is-active "$UNIT" 2>/dev/null)"
-  echo "Resident scanner ($UNIT): $state"
-  echo "Current --memory limit           : ${cur:-n/a (not running)}"
+  echo "Resident scanner ($UNIT): $(state_c "$state")"
+  echo "Current --memory limit           : $(mem_c "$cur")"
   echo "Packaged launcher limit          : $(grep -m1 -o -- '^--memory=[^ ]*' "$LAUNCHER" | cut -d= -f2)"
   if [[ -f "$DROPIN" ]]; then
-    echo "Override drop-in                 : present ($DROPIN)"
+    echo "Override drop-in                 : ${G}present${N} ($DROPIN)"
     if [[ -f "$OVR_SRC_SUM" ]] && ! sha256sum --quiet -c "$OVR_SRC_SUM" >/dev/null 2>&1; then
       warn "the packaged launcher changed since the override was made (ai-bolit update); re-run this script to regenerate it."
     fi
   else
-    echo "Override drop-in                 : none"
+    echo "Override drop-in                 : ${Y}none${N}"
   fi
   if [[ "$state" != active ]]; then
     warn "$UNIT is not running - real-time malware scanning is off."
@@ -224,7 +234,7 @@ fi
 
 info "After:"
 show_processes
-echo "Resident scanner ($UNIT): $(systemctl is-active "$UNIT")"
-echo "Socket ($SOCKET)        : $(systemctl is-active "$SOCKET")"
-echo "New --memory limit      : $(resident_mem)"
+echo "Resident scanner ($UNIT): $(state_c "$(systemctl is-active "$UNIT")")"
+echo "Socket ($SOCKET)        : $(state_c "$(systemctl is-active "$SOCKET")")"
+echo "New --memory limit      : $(mem_c "$(resident_mem)")"
 verify_hint
