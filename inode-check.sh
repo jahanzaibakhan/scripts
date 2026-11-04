@@ -33,6 +33,7 @@ set -uo pipefail
 THRESHOLD=85
 BIG_DIR_SIZE="+8M"
 FIND_TIMEOUT=600
+PER_DIR_TIMEOUT=900
 CHECK_ONLY=0
 ASSUME_YES=0
 FORCE=0
@@ -77,6 +78,12 @@ fi
 [[ -d "$FS" ]] || die "$FS is not a directory."
 mountpoint -q "$FS" 2>/dev/null || [[ "$FS" == "/" ]] || warn "Note: $FS is not a mount point, usage shown is for the filesystem containing it."
 
+# block storage holds databases and app data: find only, never delete there
+if [[ "$FS" != "/" ]]; then
+  CHECK_ONLY=1
+  FIND_TIMEOUT=120
+fi
+
 # other real filesystems, shown for context only
 other_fs_summary() {
   df -P -i -x tmpfs -x devtmpfs -x squashfs -x overlay 2>/dev/null | awk -v fs="$FS" 'NR>1 && $6!=fs {printf "  %-28s inodes %s\n", $6, $5}'
@@ -114,6 +121,7 @@ fi
 (( START_PCT >= THRESHOLD )) && warn $'\nInodes are at '"${START_PCT}%"$' (threshold '"${THRESHOLD}"$'%).'
 
 # ---- 1. huge directories ---------------------------------------------------
+[[ "$FS" != "/" ]] && say "${G}Read-only mode on $FS: this script only reports here, nothing is deleted.${N}"
 hdr "Hunting huge directories (dir size > ${BIG_DIR_SIZE#+}, can take a few minutes)"
 say "Low I/O priority, ${FIND_TIMEOUT}s limit..."
 if [[ "$FS" == "/" ]]; then
@@ -121,9 +129,13 @@ if [[ "$FS" == "/" ]]; then
 else
   HUNT_ROOTS=("$FS")
 fi
-BIG=$(ionice -c3 nice -n19 timeout "$FIND_TIMEOUT" \
-  find "${HUNT_ROOTS[@]}" -xdev -type d -size "$BIG_DIR_SIZE" -printf '%s\t%p\n' 2>/dev/null \
-  | sort -rn | head -15)
+BIG_TMP=$(mktemp)
+ionice -c3 nice -n19 timeout "$FIND_TIMEOUT" \
+  find "${HUNT_ROOTS[@]}" -xdev -type d -size "$BIG_DIR_SIZE" -printf '%s\t%p\n' 2>/dev/null > "$BIG_TMP"
+FIND_RC=$?
+BIG=$(sort -rn "$BIG_TMP" | head -15)
+rm -f "$BIG_TMP"
+(( FIND_RC == 124 )) && warn "Scan hit the ${FIND_TIMEOUT}s limit - the list below is partial."
 
 SAFE=(); OTHER=()
 if [[ -n "$BIG" ]]; then
@@ -132,7 +144,7 @@ if [[ -n "$BIG" ]]; then
   while IFS=$'\t' read -r sz path; do
     [[ -z "$path" ]] && continue
     human=$(numfmt --to=iec "$sz" 2>/dev/null || echo "${sz}B")
-    if [[ "$path" =~ $SAFE_RE ]]; then
+    if [[ "$path" =~ $SAFE_RE && "$path" != */mysql/* && "$path" != */lost+found/* ]]; then
       SAFE+=("$path")
       printf '%-12s %s%-9s%s %s\n' "$human" "$G" "clearable" "$N" "$path"
     else
@@ -141,18 +153,27 @@ if [[ -n "$BIG" ]]; then
     fi
   done <<< "$BIG"
 else
-  say "${Y}No directory over ${BIG_DIR_SIZE#+} found.${N} The inodes are spread across many normal directories."
+  if (( FIND_RC == 124 )); then
+    say "${Y}Timed out after ${FIND_TIMEOUT}s before finding a directory over ${BIG_DIR_SIZE#+}.${N} The scan was incomplete, not empty - see the per-directory counts below."
+  else
+    say "${Y}No directory over ${BIG_DIR_SIZE#+} found.${N} The inodes are spread across many normal directories."
+  fi
 fi
 
 # ---- 2. apps ranked by inode count ----------------------------------------
 hdr "Top apps by inode count"
 APPROOT=$(ls -d /home/*.cloudwaysapps.com 2>/dev/null | head -1)
 if [[ "$FS" != "/" ]]; then
-  say "Top directories on $FS (2 levels):"
-  ionice -c3 nice -n19 timeout "$FIND_TIMEOUT" du -x --inodes -d2 "$FS" 2>/dev/null \
-    | sort -rn | sed -n '2,9p' | while IFS=$'\t' read -r n d; do
-    printf '%s%12s%s  %s\n' "$B" "$n" "$N" "$d"
-  done
+  say "Inode count per top-level directory on $FS (printed as each finishes, ${PER_DIR_TIMEOUT}s limit each):"
+  while IFS= read -r d; do
+    n=$(ionice -c3 nice -n19 timeout "$PER_DIR_TIMEOUT" du -x --inodes -s "$d" 2>/dev/null | cut -f1)
+    if [[ -n "$n" ]]; then
+      printf '%s%12s%s  %s\n' "$B" "$n" "$N" "$d"
+    else
+      printf '%s%12s%s  %s\n' "$Y" ">timeout" "$N" "$d"
+    fi
+  done < <(find "$FS" -mindepth 1 -maxdepth 1 -xdev -type d ! -name lost+found 2>/dev/null)
+  say "(drill into the biggest: ${B}sudo ionice -c3 du -x --inodes -d1 <dir> | sort -rn | head${N})"
 elif [[ -n "$APPROOT" ]]; then
   for a in $(ls "$APPROOT" | grep -E '^[a-z]{10}$'); do
     n=$(ionice -c3 timeout 60 du -x --inodes -s "$APPROOT/$a" 2>/dev/null | cut -f1)
