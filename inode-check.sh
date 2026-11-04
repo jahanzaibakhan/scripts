@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # inode-check.sh
-# Checks inode and disk usage on / and, when inodes are above the threshold,
+# Checks inode and disk usage on the attached block storage volume
+# (/mnt/BLOCKSTORAGE) when it is mounted, otherwise on /, and, when inodes are above the threshold,
 # finds the directories holding them, offers to clear the safe ones (caches,
 # tmp, sessions) and shows the result.
 #
@@ -24,6 +25,7 @@
 #   bash inode-check.sh --yes              # clear safe candidates, no prompt
 #   bash inode-check.sh --threshold 70     # act above 70% (default 85)
 #   bash inode-check.sh --force            # run the hunt even if below threshold
+#   bash inode-check.sh --fs /mnt/other    # check a specific mount point instead
 #   curl -fsSL <raw-url> | sudo bash -s -- [option]
 
 set -uo pipefail
@@ -34,7 +36,8 @@ FIND_TIMEOUT=600
 CHECK_ONLY=0
 ASSUME_YES=0
 FORCE=0
-FS="/"
+FS=""
+BLOCK_MOUNT="/mnt/BLOCKSTORAGE"   # preferred target when attached; falls back to /
 # paths we consider safe to empty (contents only; the directory itself stays)
 SAFE_RE='(/wp-content/cache(/|$)|/wp-content/breeze-minification|/\.tmb(/|$)|/tmp(/|$)|/var/cache(/|$)|/var/lib/php/sessions(/|$)|/sessions(/|$))'
 
@@ -56,6 +59,7 @@ while [[ $# -gt 0 ]]; do
     --check) CHECK_ONLY=1 ;;
     --yes|-y) ASSUME_YES=1 ;;
     --force) FORCE=1 ;;
+    --fs) shift; FS="${1:-}"; [[ -n "$FS" ]] || die "--fs needs a mount point" ;;
     --threshold) shift; THRESHOLD="${1:-}"; [[ "$THRESHOLD" =~ ^[0-9]+$ ]] || die "--threshold needs a number" ;;
     -h|--help) usage ;;
     *) die "Unknown option: $1 (try --help)" ;;
@@ -65,6 +69,18 @@ done
 
 [[ "$(uname -s)" == "Linux" ]] || die "Linux only."
 [[ $EUID -eq 0 ]] || die "Run as root (sudo bash $0)."
+
+# pick the filesystem: --fs wins, then the block storage volume if mounted, else /
+if [[ -z "$FS" ]]; then
+  if mountpoint -q "$BLOCK_MOUNT" 2>/dev/null; then FS="$BLOCK_MOUNT"; else FS="/"; fi
+fi
+[[ -d "$FS" ]] || die "$FS is not a directory."
+mountpoint -q "$FS" 2>/dev/null || [[ "$FS" == "/" ]] || warn "Note: $FS is not a mount point, usage shown is for the filesystem containing it."
+
+# other real filesystems, shown for context only
+other_fs_summary() {
+  df -P -i -x tmpfs -x devtmpfs -x squashfs -x overlay 2>/dev/null | awk -v fs="$FS" 'NR>1 && $6!=fs {printf "  %-28s inodes %s\n", $6, $5}'
+}
 
 ipct()  { df -P -i "$FS" | awk 'NR==2{gsub("%","",$5); print $5+0}'; }
 iused() { df -P -i "$FS" | awk 'NR==2{print $3}'; }
@@ -85,6 +101,8 @@ show_usage() {
 
 hdr "Usage on $FS"
 show_usage
+OTHERS=$(other_fs_summary)
+if [[ -n "$OTHERS" ]]; then say; say "Other filesystems:"; say "$OTHERS"; fi
 START_PCT=$(ipct)
 
 if (( START_PCT < THRESHOLD )) && (( FORCE == 0 )); then
@@ -98,8 +116,13 @@ fi
 # ---- 1. huge directories ---------------------------------------------------
 hdr "Hunting huge directories (dir size > ${BIG_DIR_SIZE#+}, can take a few minutes)"
 say "Low I/O priority, ${FIND_TIMEOUT}s limit..."
+if [[ "$FS" == "/" ]]; then
+  HUNT_ROOTS=(/home /var /tmp /root /opt)
+else
+  HUNT_ROOTS=("$FS")
+fi
 BIG=$(ionice -c3 nice -n19 timeout "$FIND_TIMEOUT" \
-  find /home /var /tmp /root /opt -xdev -type d -size "$BIG_DIR_SIZE" -printf '%s\t%p\n' 2>/dev/null \
+  find "${HUNT_ROOTS[@]}" -xdev -type d -size "$BIG_DIR_SIZE" -printf '%s\t%p\n' 2>/dev/null \
   | sort -rn | head -15)
 
 SAFE=(); OTHER=()
@@ -124,7 +147,13 @@ fi
 # ---- 2. apps ranked by inode count ----------------------------------------
 hdr "Top apps by inode count"
 APPROOT=$(ls -d /home/*.cloudwaysapps.com 2>/dev/null | head -1)
-if [[ -n "$APPROOT" ]]; then
+if [[ "$FS" != "/" ]]; then
+  say "Top directories on $FS (2 levels):"
+  ionice -c3 nice -n19 timeout "$FIND_TIMEOUT" du -x --inodes -d2 "$FS" 2>/dev/null \
+    | sort -rn | sed -n '2,9p' | while IFS=$'\t' read -r n d; do
+    printf '%s%12s%s  %s\n' "$B" "$n" "$N" "$d"
+  done
+elif [[ -n "$APPROOT" ]]; then
   for a in $(ls "$APPROOT" | grep -E '^[a-z]{10}$'); do
     n=$(ionice -c3 timeout 60 du -x --inodes -s "$APPROOT/$a" 2>/dev/null | cut -f1)
     printf '%s\t%s\n' "${n:-0}" "$a"
@@ -140,7 +169,7 @@ fi
 manual_cmds() {
   hdr "Manual commands"
   say "Re-check usage:"
-  say "  ${B}df -i / && df -h /${N}"
+  say "  ${B}df -i $FS && df -h $FS${N}"
   if (( ${#SAFE[@]} > 0 )); then
     say
     say "Empty a cache directory gently (low I/O priority, keeps the directory):"
@@ -159,8 +188,13 @@ manual_cmds() {
   fi
   say
   say "Find hogs yourself:"
-  say "  ${B}sudo find /home -xdev -type d -size +8M -printf '%s %p\\n' | sort -rn | head${N}"
-  say "  ${B}sudo ionice -c3 du -x --inodes -d1 /home/*.cloudwaysapps.com | sort -rn | head${N}"
+  if [[ "$FS" == "/" ]]; then
+    say "  ${B}sudo find /home -xdev -type d -size +8M -printf '%s %p\\n' | sort -rn | head${N}"
+    say "  ${B}sudo ionice -c3 du -x --inodes -d1 /home/*.cloudwaysapps.com | sort -rn | head${N}"
+  else
+    say "  ${B}sudo find $FS -xdev -type d -size +8M -printf '%s %p\\n' | sort -rn | head${N}"
+    say "  ${B}sudo ionice -c3 du -x --inodes -d2 $FS | sort -rn | head${N}"
+  fi
   say "Then stop whatever is creating them (cache plugin, bots hitting random URLs) or it comes back."
 }
 
