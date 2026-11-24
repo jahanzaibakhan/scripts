@@ -68,7 +68,8 @@ is_up() { systemctl is-active --quiet "$SVC" && mysqladmin ping >/dev/null 2>&1;
 
 # Keep only the lines from the last start attempt, so old incidents earlier
 # in the log are not mistaken for the current one.
-last_attempt() { awk '/starting as process/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}'; }
+# MariaDB 10.5+: "Starting MariaDB ... as process N"; older: "... starting as process N".
+last_attempt() { awk '/as process [0-9]+/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}'; }
 
 # Log lines from the most recent start attempt (journal + error log).
 recent_log() {
@@ -116,9 +117,15 @@ BLOCKERS=()   # things it does not fix
 read -r AVAIL_KB USE_PCT < <(df -Pk "$DATADIR" | awk 'NR==2{gsub("%","",$5); print $4, $5}')
 IUSE_PCT="$(df -Pi "$DATADIR" | awk 'NR==2{gsub("%","",$5); print $5}')"
 echo "Disk      : ${USE_PCT}% used, $((AVAIL_KB/1024)) MB free; inodes ${IUSE_PCT:-?}% used"
-if (( AVAIL_KB < 512000 )) || (( USE_PCT >= 99 )) || [[ "${IUSE_PCT:-0}" =~ ^[0-9]+$ && "${IUSE_PCT:-0}" -ge 99 ]] \
-   || [[ -n "$(match 'No space left on device|errno: ?28|Disk (is )?full' 1)" ]]; then
+# Decide on the disk as it is NOW: the log may show disk-full errors from a
+# start attempt made before someone freed space.
+DISK_RE="No space left on device|errno: ?28|error 28|out of disk space|Disk (is )?full"
+DISK_IN_LOG="$(match "$DISK_RE" 1)"
+if (( AVAIL_KB < 512000 )) || (( USE_PCT >= 99 )) || [[ "${IUSE_PCT:-0}" =~ ^[0-9]+$ && "${IUSE_PCT:-0}" -ge 99 ]]; then
   BLOCKERS+=("DISK: the datadir filesystem is (nearly) full - free space first; this script will not delete data.")
+elif [[ -n "$DISK_IN_LOG" ]]; then
+  echo "            (last start failed on disk full, but there is space now - a new start can work)"
+  ISSUES+=("RETRY: the last start failed because the disk was full; space is available now.")
 fi
 
 # 2. Stray mariadbd/mysqld processes not owned by systemd.
@@ -176,7 +183,8 @@ fi
 INNO_LINES="$(grep -E "InnoDB:|Plugin 'InnoDB'" <<<"$LOG" \
   | grep -E "\[ERROR\]|corrupt|Cannot allocate|Operating system error|Missing MLOG|log sequence number .*in the future|Upgrade after a crash|init function returned error|registration as a STORAGE ENGINE failed" \
   | grep -vE "Unable to lock|error: ?11" | tail -n 8)"
-INNO_REAL="$(grep -vE "registration as a STORAGE ENGINE failed|Plugin initialization aborted|init function returned error" <<<"$INNO_LINES")"
+# Disk-full InnoDB errors are handled by the DISK check above, not here.
+INNO_REAL="$(grep -vE "registration as a STORAGE ENGINE failed|Plugin initialization aborted|init function returned error|$DISK_RE|Unable to create the shared innodb_temporary|Could not set the file size" <<<"$INNO_LINES")"
 if [[ -n "$INNO_LINES" ]]; then
   echo "InnoDB    :"
   sed 's/^/            /' <<<"$INNO_LINES" | cut -c1-220
