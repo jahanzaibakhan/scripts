@@ -209,16 +209,30 @@ if [[ -n "$BAD_OWN" || -n "$(match 'Permission denied|errno: ?13' 1)" ]]; then
 fi
 
 # 5. InnoDB problems (reported, not fixed). Lock errors are covered by STRAY.
+# Tables whose .ibd file / database folder was deleted from disk but are still
+# in the InnoDB dictionary: InnoDB logs a block of errors per table, ignores
+# them and starts anyway - they are not why MariaDB aborts.
+MISSING_TS_RE="Could not find a valid tablespace file|Ignoring tablespace for|Operating system error number 2 in a file operation|The error means the system cannot find the path specified|If you are installing InnoDB, remember|Cannot open datafile for read-only: .*OS error: 71|Tablespace [0-9]+ was not found at"
+MISSING_TABLES="$(grep -oE 'Ignoring tablespace for `[^`]+`\.`[^`]+`' <<<"$LOG" | sed 's/^Ignoring tablespace for //' | sort -u)"
+INNO_STARTED="$(match 'InnoDB: .*started; log sequence number' 1)"
 INNO_LINES="$(grep -E "InnoDB:|Plugin 'InnoDB'" <<<"$LOG" \
   | grep -E "\[ERROR\]|corrupt|Cannot allocate|Operating system error|Missing MLOG|log sequence number .*in the future|Upgrade after a crash|init function returned error|registration as a STORAGE ENGINE failed" \
-  | grep -vE "Unable to lock|error: ?11" | tail -n 8)"
+  | grep -vE "Unable to lock|error: ?11" | grep -vE "$MISSING_TS_RE" | tail -n 8)"
 # Disk-full InnoDB errors are handled by the DISK check above, not here.
 INNO_REAL="$(grep -vE "registration as a STORAGE ENGINE failed|Plugin initialization aborted|init function returned error|$DISK_RE|Unable to create the shared innodb_temporary|Could not set the file size" <<<"$INNO_LINES")"
+if [[ -n "$MISSING_TABLES" ]]; then
+  echo "Orphans   : $(( $(wc -l <<<"$MISSING_TABLES") )) InnoDB table(s) have no .ibd file on disk (ignored by InnoDB, not the cause):"
+  sed -E 's/`\.`.*//; s/`//g' <<<"$MISSING_TABLES" | sort | uniq -c | while read -r n db; do
+    printf '            db %-20s %s table(s)%s\n' "$db" "$n" "$([[ -d "$DATADIR/$db" ]] || echo ' - database folder missing')"
+  done
+fi
 if [[ -n "$INNO_LINES" ]]; then
   echo "InnoDB    :"
   sed 's/^/            /' <<<"$INNO_LINES" | cut -c1-220
 fi
-if [[ -n "$INNO_REAL" ]]; then
+if [[ -n "$INNO_REAL" && -n "$INNO_STARTED" ]]; then
+  echo "            (InnoDB still started after these errors - they are not why $SVC aborts)"
+elif [[ -n "$INNO_REAL" ]]; then
   BLOCKERS+=("INNODB: InnoDB has its own error (above). This script does not repair InnoDB - investigate before any innodb_force_recovery.")
 elif [[ -n "$INNO_LINES" && ${#STRAY[@]} -eq 0 && -z "$LOCKMSG" ]]; then
   echo "            (InnoDB failed without a specific reason in the last 300 lines - check earlier in $ERRLOG)"
@@ -316,6 +330,10 @@ if is_up; then
   if [[ -n "$CRASHED" ]]; then
     echo "WARNING: tables reported as crashed - repair them (e.g. fix_crashed_tables.sh in this repo):"
     sed 's/^/  /' <<<"$CRASHED" | cut -c1-220
+  fi
+  if [[ -n "$MISSING_TABLES" ]]; then
+    echo "NOTE: $(( $(wc -l <<<"$MISSING_TABLES") )) orphan InnoDB table(s) with no .ibd file (see Orphans above)."
+    echo "      Restore the database from backup, or drop the tables/database if the app was removed."
   fi
   command -v monit >/dev/null && monit monitor mysql >/dev/null 2>&1
   [[ -n "$BACKUP" ]] && echo "Old Aria logs kept in $BACKUP - delete once you are happy: rm -rf $BACKUP"
