@@ -124,6 +124,11 @@ match() { grep -E "$1" <<<"$LOG" | tail -n "${2:-5}"; }
 LOCKMSG="$(match "Can't lock aria control file|aria_log_control.*error: ?11|Unable to lock .*ibdata1|lock wait timeout.*aria" 3)"
 ARIA_RE="Aria engine: (log initialization failed|.*(error|failed|corrupt))|Aria recovery failed|Plugin 'Aria' (init function returned error|registration as a STORAGE ENGINE failed)|Unknown storage engine 'Aria'|Could not open mysql\.plugin table.*Aria|aria_log(_control)?.*(Wrong|corrupt|bad|incorrect|error)|Got error [0-9]+ .*aria_log|Error in Aria"
 ARIA_LINES="$(match "$ARIA_RE" 6)"
+# Aria recovery that ends in a crash (signal 11) is a corrupt Aria log too.
+if [[ -z "$ARIA_LINES" ]] && grep -q "Aria engine: starting recovery" <<<"$LOG" \
+   && grep -qE "got signal 11|signal=SEGV" <<<"$LOG"; then
+  ARIA_LINES="$(match "Aria engine: starting recovery|got signal 11" 4)"
+fi
 shopt -s nullglob
 ARIA_FILES=("$DATADIR"/aria_log_control "$DATADIR"/aria_log.[0-9]*)
 shopt -u nullglob
