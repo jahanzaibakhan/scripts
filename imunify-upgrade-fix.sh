@@ -32,6 +32,11 @@
 #     installed Imunify set is installed together, plus every dependency the
 #     apt dry run names, checked by simulation before anything runs
 #   - stale bytecode ("ValueError: bad marshal data") -> __pycache__ cleared
+#   - Imunify packages on hold (apt-mark hold): apt cannot upgrade them, so
+#     e.g. imunify-core stays old while antivirus/firewall are newer
+#     ("ImportError: cannot import name 'is_cluster'") -> the holds on the
+#     Imunify-related packages only are lifted before the install (other
+#     holds are untouched); the re-hold command is printed at the end
 # Fix: dpkg --configure -a, apt-get update, install the Imunify package set
 # (retried once with --force-overwrite ONLY when every conflict is between
 # Imunify packages), reinstall packages with corrupted files at their
@@ -115,12 +120,15 @@ imunify_lists() { ls /var/lib/apt/lists/ 2>/dev/null | grep -cE 'imunify.*_Packa
 # to be installed" / "but <old> is to be installed"), found by repeated dry
 # runs. SIM_SET = the final dry-run output.
 SET=(); SIM_SET=""
+# While Imunify packages are still on hold (check mode, before the fix lifts
+# them) the dry run simulates as if they were not.
+SIM_HOLD=()
 plan_set() {
   local i n add new
-  mapfile -t SET < <(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk '$1 ~ /^i/{print $2}' | grep -E "$IMUNIFY_SET_RE")
+  mapfile -t SET < <(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk '$1 ~ /^[ih]/ && substr($1,2,1) != "n" {print $2}' | grep -E "$IMUNIFY_SET_RE")
   (( ${#SET[@]} )) || return 0
   for i in 1 2 3 4 5 6; do
-    SIM_SET="$(apt-get -s -o Debug::NoLocking=1 install "${SET[@]}" 2>&1)"
+    SIM_SET="$(apt-get -s -o Debug::NoLocking=1 "${SIM_HOLD[@]}" install "${SET[@]}" 2>&1)"
     add="$(grep -E 'Depends: .* but ' <<<"$SIM_SET" | grep -oP 'Depends: \K[a-z0-9][a-z0-9.+-]*' | sort -u)"
     new=()
     for n in $add; do printf '%s\n' "${SET[@]}" | grep -qxF "$n" || new+=("$n"); done
@@ -246,6 +254,21 @@ if [[ "$(unit_state imunify360)" != active ]]; then
   if grep -q 'bad marshal data' <<<"$JRN"; then
     PYC=1
     ISSUES+=("PYC: 'ValueError: bad marshal data' - corrupt compiled Python cache; will clear __pycache__ in /opt/imunify360/venv and /opt/alt/python-internal.")
+  fi
+fi
+
+# Imunify-related packages on hold: apt will not upgrade them, so the set
+# cannot be brought in step. Only an issue while something is wrong.
+mapfile -t HELD < <(apt-mark showhold 2>/dev/null | grep -E "$IMUNIFY_PKG_RE")
+HOLD_FIX=0
+if (( ${#HELD[@]} )); then
+  if [[ "$(unit_state imunify360)" != active ]] || (( ${#ISSUES[@]} )); then
+    HOLD_FIX=1; SIM_HOLD=(--allow-change-held-packages)
+    ISSUES+=("HELD: ${#HELD[@]} Imunify-related package(s) on hold (apt-mark hold): $(printf '%s ' "${HELD[@]:0:8}")$( (( ${#HELD[@]} > 8 )) && echo "...")- apt cannot upgrade them, so the Imunify set stays out of step; will lift the holds on these packages only.")
+    NONIMU="$(apt-mark showhold 2>/dev/null | grep -vE "$IMUNIFY_PKG_RE" | tr '\n' ' ')"
+    [[ -n "$NONIMU" ]] && echo "Other holds: $NONIMU(not Imunify - left as is)"
+  else
+    echo "Held       : ${#HELD[@]} Imunify package(s) on hold, but imunify360 is running - left as is."
   fi
 fi
 
@@ -400,6 +423,7 @@ fi
 echo
 echo "The fix will:"
 (( ${#ZINFO[@]} )) && echo "  0. move ${#ZINFO[@]} zero-filled /var/lib/dpkg/info file(s) to a backup folder (reinstalled in step 3)"
+(( HOLD_FIX )) && echo "  0. apt-mark unhold ${#HELD[@]} Imunify-related package(s) (other holds untouched)"
 echo "  1. dpkg --configure -a"
 echo "  2. apt-get update (refresh the Imunify repo lists)"
 echo "  3. re-plan and install the Imunify package set with its new dependencies (never removing Imunify;"
@@ -437,6 +461,14 @@ if (( ${#ZINFO[@]} )); then
   if mkdir -p "$ZBK" && mv "${ZINFO[@]}" "$ZBK"/; then
     fixed "moved ${#ZINFO[@]} zero-filled dpkg info file(s) to $ZBK"
   else red "Could not move the zero-filled dpkg info files - stopping."; summary; show_status; exit 1; fi
+fi
+
+if (( HOLD_FIX )); then
+  echo "held before fix: ${HELD[*]}" >>"$LOGF"
+  if apt-mark unhold "${HELD[@]}" >>"$LOGF" 2>&1; then
+    SIM_HOLD=()
+    fixed "lifted the hold on ${#HELD[@]} Imunify-related package(s): ${HELD[*]}"
+  else red "apt-mark unhold failed - stopping."; summary; show_status; exit 1; fi
 fi
 
 echo "[1/6] dpkg --configure -a"
@@ -525,6 +557,7 @@ if [[ "$(unit_state imunify360)" == active ]]; then
   fixed "imunify360 is running ($(timeout 20 imunify360-agent version 2>/dev/null | grep -E '[0-9]+\.[0-9]+' | tail -n1))"
   summary; show_status
   green "SUCCESS: Imunify360 is RUNNING again."
+  (( HOLD_FIX )) && yellow "Holds were lifted. If they were set on purpose, re-hold at the new versions with: apt-mark hold ${HELD[*]}"
   exit 0
 fi
 summary; show_status
