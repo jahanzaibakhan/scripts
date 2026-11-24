@@ -15,6 +15,9 @@
 #     "SyntaxError: source code string cannot contain null bytes" crash loop.
 #     Found with dpkg --verify (md5 mismatch AND file starts with 4K of zeros,
 #     so normal config edits are never flagged).
+#   - zero-filled files in dpkg's own database (/var/lib/dpkg/info/<pkg>.*)
+#     that make every apt run fail ("fgets gave an empty string from ...")
+#     -> moved to a backup folder and the package reinstalled
 # Fix: dpkg --configure -a, apt-get -f install (retried once with
 # --force-overwrite ONLY when every conflict is between Imunify packages),
 # reinstall packages with corrupted files at their INSTALLED version,
@@ -158,6 +161,21 @@ if [[ -n "$CORRUPT" ]]; then
   ISSUES+=("CORRUPT: $(wc -l <<<"$CORRUPT") file(s) are zero-filled (null bytes) in: ${CORRUPT_PKGS[*]} - will reinstall at the installed version.")
 fi
 
+# Zero-filled files in dpkg's own database (/var/lib/dpkg/info/<pkg>.triggers,
+# .md5sums, ...) make every apt run fail ("fgets gave an empty string from
+# .../<pkg>.triggers"). They are moved aside and the package reinstalled, which
+# writes them again. Any package, not just Imunify - apt cannot work otherwise.
+ZINFO=()
+for f in /var/lib/dpkg/info/*; do
+  [[ -f "$f" && -s "$f" ]] || continue
+  [[ "$(head -c 4096 "$f" | tr -d '\000' | wc -c)" -eq 0 ]] && ZINFO+=("$f")
+done
+ZINFO_PKGS=()
+if (( ${#ZINFO[@]} )); then
+  mapfile -t ZINFO_PKGS < <(for f in "${ZINFO[@]}"; do b="${f##*/}"; b="${b%.*}"; echo "${b%%:*}"; done | sort -u)
+  ISSUES+=("DPKG-DB: ${#ZINFO[@]} zero-filled file(s) in /var/lib/dpkg/info for: ${ZINFO_PKGS[*]} - apt fails on them; will move them aside and reinstall those packages.")
+fi
+
 DOWN=()
 for u in "${START_UNITS[@]}"; do
   l="$(unit_load "$u")"
@@ -237,6 +255,7 @@ fi
 
 echo
 echo "The fix will:"
+(( ${#ZINFO[@]} )) && echo "  0. move ${#ZINFO[@]} zero-filled /var/lib/dpkg/info file(s) to a backup folder (reinstalled in step 2)"
 echo "  1. dpkg --configure -a"
 echo "  2. apt-get -f install (retry once with --force-overwrite only if every conflict is Imunify-vs-Imunify)"
 (( ${#CORRUPT_PKGS[@]} )) && echo "     + apt-get install --reinstall ${CORRUPT_PKGS[*]} (installed versions) to replace the zero-filled files"
@@ -248,6 +267,13 @@ echo
 
 LOGF="/root/imunify-upgrade-fix-$(date +%Y%m%d-%H%M%S).log"
 echo "Full apt/dpkg output: $LOGF"
+
+if (( ${#ZINFO[@]} )); then
+  ZBK="${LOGF%.log}-dpkg-info"
+  mkdir -p "$ZBK" && mv "${ZINFO[@]}" "$ZBK"/ \
+    && echo "[0/5] moved ${#ZINFO[@]} zero-filled dpkg info file(s) to $ZBK" \
+    || { red "Could not move the zero-filled dpkg info files - stopping."; show_status; exit 1; }
+fi
 
 echo "[1/5] dpkg --configure -a"
 dpkg --configure -a >>"$LOGF" 2>&1 || yellow "      dpkg --configure -a reported errors (expected if a package needs a newer dependency) - continuing with apt."
@@ -270,6 +296,12 @@ if ! apt-get "${APT_OPTS[@]}" -f install >>"$LOGF" 2>&1; then
   fi
 fi
 dpkg --configure -a >>"$LOGF" 2>&1
+
+if (( ${#ZINFO_PKGS[@]} )); then
+  echo "      reinstalling packages whose dpkg info files were zero-filled: ${ZINFO_PKGS[*]}"
+  apt-get "${APT_OPTS[@]}" install --reinstall "${ZINFO_PKGS[@]}" >>"$LOGF" 2>&1 \
+    || { red "      reinstall of ${ZINFO_PKGS[*]} failed. Last lines:"; tail -n 6 "$LOGF" | cut -c1-220; show_status; exit 1; }
+fi
 
 if (( ${#CORRUPT_PKGS[@]} )); then
   echo "      reinstalling packages with zero-filled files: ${CORRUPT_PKGS[*]}"
