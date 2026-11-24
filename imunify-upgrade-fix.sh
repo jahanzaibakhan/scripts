@@ -18,6 +18,8 @@
 #   - zero-filled files in dpkg's own database (/var/lib/dpkg/info/<pkg>.*)
 #     that make every apt run fail ("fgets gave an empty string from ...")
 #     -> moved to a backup folder and the package reinstalled
+#   - disk full on /var: shows what uses the space and offers a safe cleanup
+#     (apt cache, journal above 100 MB, already-rotated logs) before the fix
 # Fix: dpkg --configure -a, apt-get -f install (retried once with
 # --force-overwrite ONLY when every conflict is between Imunify packages),
 # reinstall packages with corrupted files at their INSTALLED version,
@@ -187,9 +189,16 @@ done
 MASKED=(); for u in "${UNITS[@]}"; do [[ "$(unit_load "$u")" == masked ]] && MASKED+=("$u"); done
 (( ${#MASKED[@]} )) && echo "Masked     : ${MASKED[*]} (left masked - not touched)"
 
-read -r AVAIL_MB < <(df -Pm /var | awk 'NR==2{print $4}')
+NEED_MB=600
+disk_free_mb() { df -Pm /var | awk 'NR==2{print $4}'; }
+AVAIL_MB="$(disk_free_mb)"
 echo "Disk /var  : ${AVAIL_MB} MB free"
-(( AVAIL_MB < 600 )) && BLOCKERS+=("DISK: only ${AVAIL_MB} MB free on /var - apt needs room to unpack; free space first.")
+DISK_LOW=0
+# Only relevant when there is something for apt to do.
+if (( AVAIL_MB < NEED_MB && ${#ISSUES[@]} > 0 )); then
+  DISK_LOW=1
+  ISSUES+=("DISK: only ${AVAIL_MB} MB free on /var - apt needs at least ${NEED_MB} MB to unpack the Imunify packages.")
+fi
 
 FAILED_RUN="$(last_failed_run)"
 FAIL_LINES=""
@@ -225,6 +234,57 @@ if (( ${#BLOCKERS[@]} )); then
   for b in "${BLOCKERS[@]}"; do red "  - $b"; done
   echo "No changes made."
   show_status; exit 2
+fi
+
+# --- Disk full: show what uses the space, offer safe cleanup ----------------------
+if (( DISK_LOW )); then
+  echo
+  echo "== Disk usage (largest first)"
+  timeout 90 du -xm --max-depth=1 / 2>/dev/null | sort -rn | sed -n '2,8p' | awk '{printf "  %7d MB  %s\n",$1,$2}'
+  echo "  -- inside /var:"
+  timeout 60 du -xm --max-depth=2 /var 2>/dev/null | sort -rn | sed -n '2,7p' | awk '{printf "  %7d MB  %s\n",$1,$2}'
+  echo "  -- largest files over 200 MB:"
+  timeout 90 find / -xdev -type f -size +200M -printf '%s\t%TY-%Tm-%Td\t%p\n' 2>/dev/null | sort -rn | head -n 8 \
+    | awk -F'\t' '{printf "  %7.0f MB  %s  %s\n",$1/1048576,$2,$3}'
+
+  # Safe cleanup: only caches and already-rotated logs - nothing an app or DB uses.
+  APT_MB="$(du -sm /var/cache/apt/archives 2>/dev/null | cut -f1)"; APT_MB="${APT_MB:-0}"
+  JRN_MB="$(du -sm /var/log/journal 2>/dev/null | cut -f1)"; JRN_MB="${JRN_MB:-0}"
+  JRN_FREE=$(( JRN_MB > 100 ? JRN_MB - 100 : 0 ))
+  ROT_MB="$(find /var/log -xdev -type f \( -name '*.gz' -o -name '*.[0-9]' -o -name '*.[0-9].log' -o -name '*.old' \) -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{printf "%d", s/1048576}')"
+  CLEAN_MB=$(( APT_MB + JRN_FREE + ROT_MB ))
+  echo
+  echo "== Safe cleanup available (caches and rotated logs only)"
+  printf '  %6d MB  apt package cache (/var/cache/apt/archives)  -> apt-get clean\n' "$APT_MB"
+  printf '  %6d MB  systemd journal above 100 MB                 -> journalctl --vacuum-size=100M\n' "$JRN_FREE"
+  printf '  %6d MB  rotated logs in /var/log (*.gz, *.1, *.old)   -> deleted\n' "$ROT_MB"
+  printf '  %6d MB  total; would leave about %d MB free (need %d)\n' "$CLEAN_MB" $(( AVAIL_MB + CLEAN_MB )) "$NEED_MB"
+
+  if [[ $MODE == check ]]; then
+    echo
+    if (( AVAIL_MB + CLEAN_MB >= NEED_MB )); then
+      yellow "Without --check the script offers this cleanup first, then the Imunify fix."
+    else
+      red "Safe cleanup alone is not enough - free more space by hand (largest items above), then re-run."
+    fi
+    echo "Check only (--check) - no changes made."
+    show_status; exit 2
+  fi
+
+  echo
+  if (( CLEAN_MB > 0 )) && confirm "Run the safe cleanup now?"; then
+    apt-get clean 2>/dev/null
+    journalctl --vacuum-size=100M >/dev/null 2>&1
+    find /var/log -xdev -type f \( -name '*.gz' -o -name '*.[0-9]' -o -name '*.[0-9].log' -o -name '*.old' \) -delete 2>/dev/null
+    AVAIL_MB="$(disk_free_mb)"
+    echo "Disk /var  : ${AVAIL_MB} MB free after cleanup"
+  fi
+  if (( AVAIL_MB < NEED_MB )); then
+    red "Still only ${AVAIL_MB} MB free on /var - free more space by hand (largest items above), then re-run this script."
+    echo "Imunify packages not touched."
+    show_status; exit 2
+  fi
+  green "Enough space now (${AVAIL_MB} MB) - continuing with the Imunify fix."
 fi
 
 # Dry run: would apt be able to finish the job?
