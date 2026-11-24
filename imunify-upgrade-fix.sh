@@ -10,8 +10,14 @@
 #   - packages left unpacked / half-configured (dpkg --audit)
 #   - the failed run's cause is shown from /var/log/apt/term.log, e.g.
 #     "trying to overwrite '...', which is also in package imunify-..."
+#   - CORRUPTED (zero-filled) files in Imunify packages or its bundled Python
+#     (alt-python-internal*), e.g. subprocess.py full of null bytes ->
+#     "SyntaxError: source code string cannot contain null bytes" crash loop.
+#     Found with dpkg --verify (md5 mismatch AND file starts with 4K of zeros,
+#     so normal config edits are never flagged).
 # Fix: dpkg --configure -a, apt-get -f install (retried once with
 # --force-overwrite ONLY when every conflict is between Imunify packages),
+# reinstall packages with corrupted files at their INSTALLED version,
 # remove the stale marker, start imunify360 / agent socket / aibolit-resident
 # (webshield and antivirus are never started or unmasked by this script - the
 # Imunify agent manages them), re-enable monit, then show the status.
@@ -64,6 +70,23 @@ START_UNITS=(imunify360 imunify360-agent.socket aibolit-resident)
 IMUNIFY_PKG_RE='^(imunify|ai-bolit|rustbolit|alt-|cloudlinux-backup-utils|app-version-detector)'
 export DEBIAN_FRONTEND=noninteractive
 APT_OPTS=(-y -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
+# Files of Imunify-related packages that are corrupted: md5 differs from the
+# package AND the file starts with 4 KiB of NUL bytes (zero-filled by a crash /
+# disk problem). Prints "pkg<TAB>path" lines.
+find_corrupt() {
+  local pkgs f n
+  pkgs="$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk '$1 ~ /^ii/{print $2}' \
+          | grep -E "$IMUNIFY_PKG_RE|^alt-python-internal")"
+  [[ -n "$pkgs" ]] || return 0
+  # shellcheck disable=SC2086
+  timeout 180 dpkg --verify $pkgs 2>/dev/null | awk '$1 ~ /^..5/ && $2 != "c" {print $NF}' | while IFS= read -r f; do
+    [[ -f "$f" && -s "$f" ]] || continue
+    n="$(head -c 4096 "$f" | tr -d '\000' | wc -c)"
+    (( n == 0 )) || continue
+    printf '%s\t%s\n' "$(dpkg -S "$f" 2>/dev/null | head -n1 | cut -d: -f1)" "$f"
+  done
+}
 
 unit_load()  { systemctl show -p LoadState --value "$1" 2>/dev/null; }      # loaded / masked / not-found
 unit_state() { systemctl is-active "$1" 2>/dev/null; }
@@ -127,6 +150,14 @@ if (( ${#AUDIT[@]} )); then
   ISSUES+=("DPKG: ${#AUDIT[@]} package(s) unpacked but not configured: $(printf '%s ' "${AUDIT[@]:0:8}")$( (( ${#AUDIT[@]} > 8 )) && echo "...")")
 fi
 
+echo "Scanning Imunify package files for corruption (dpkg --verify) ..."
+CORRUPT="$(find_corrupt)"
+CORRUPT_PKGS=()
+if [[ -n "$CORRUPT" ]]; then
+  mapfile -t CORRUPT_PKGS < <(cut -f1 <<<"$CORRUPT" | grep -v '^$' | sort -u)
+  ISSUES+=("CORRUPT: $(wc -l <<<"$CORRUPT") file(s) are zero-filled (null bytes) in: ${CORRUPT_PKGS[*]} - will reinstall at the installed version.")
+fi
+
 DOWN=()
 for u in "${START_UNITS[@]}"; do
   l="$(unit_load "$u")"
@@ -159,9 +190,14 @@ if (( ${#ISSUES[@]} == 0 && ${#BLOCKERS[@]} == 0 )); then
   show_status; exit 0
 fi
 
-red "RESULT: IMUNIFY ISSUE FOUND - interrupted Imunify package upgrade:"
+red "RESULT: IMUNIFY ISSUE FOUND:"
 for i in "${ISSUES[@]}"; do red "  - $i"; done
-if [[ -n "$FAIL_LINES" ]]; then
+if [[ -n "$CORRUPT" ]]; then
+  cut -f2 <<<"$CORRUPT" | head -n 10 | while IFS= read -r f; do red "      zero-filled: $f"; done
+  CRASH="$(journalctl -u imunify360 -n 30 -o cat --no-pager 2>/dev/null | grep -E 'Error:|null bytes' | tail -n1)"
+  [[ -n "$CRASH" ]] && red "      imunify360 crash: $CRASH"
+fi
+if [[ -n "$FAIL_LINES" && ( -e "$MARKER" || ${#AUDIT[@]} -gt 0 ) ]]; then
   red "  Failed apt run ($FAIL_WHEN):"
   sed 's/^/      /' <<<"$FAIL_LINES" | cut -c1-220 | while IFS= read -r l; do red "$l"; done
 fi
@@ -184,6 +220,14 @@ else
   echo "  OK: $(grep -c '^Inst' <<<"$SIM") to install/upgrade, $(grep -c '^Conf' <<<"$SIM") to configure, $(grep -c '^Remv' <<<"$SIM") to remove."
   (( $(grep -c '^Remv' <<<"$SIM") )) && yellow "  Packages would be REMOVED: $(awk '/^Remv/{print $2}' <<<"$SIM" | tr '\n' ' ')"
 fi
+for p in "${CORRUPT_PKGS[@]}"; do
+  v="$(dpkg-query -W -f='${Version}' "$p" 2>/dev/null)"
+  if apt-cache madison "$p" 2>/dev/null | awk -F'|' '{gsub(/ /,"",$2); print $2}' | grep -qxF "$v"; then
+    echo "  reinstall $p=$v: available in the repo"
+  else
+    yellow "  reinstall $p: installed version $v is no longer in the repo - the current candidate will be installed instead"
+  fi
+done
 
 if [[ $MODE == check ]]; then
   echo
@@ -195,6 +239,7 @@ echo
 echo "The fix will:"
 echo "  1. dpkg --configure -a"
 echo "  2. apt-get -f install (retry once with --force-overwrite only if every conflict is Imunify-vs-Imunify)"
+(( ${#CORRUPT_PKGS[@]} )) && echo "     + apt-get install --reinstall ${CORRUPT_PKGS[*]} (installed versions) to replace the zero-filled files"
 echo "  3. remove $MARKER once dpkg --audit is clean"
 echo "  4. daemon-reload and start ${START_UNITS[*]} (webshield is left to the Imunify agent)"
 echo "  5. re-enable monit for imunify-resident"
@@ -225,6 +270,24 @@ if ! apt-get "${APT_OPTS[@]}" -f install >>"$LOGF" 2>&1; then
   fi
 fi
 dpkg --configure -a >>"$LOGF" 2>&1
+
+if (( ${#CORRUPT_PKGS[@]} )); then
+  echo "      reinstalling packages with zero-filled files: ${CORRUPT_PKGS[*]}"
+  for p in "${CORRUPT_PKGS[@]}"; do
+    v="$(dpkg-query -W -f='${Version}' "$p" 2>/dev/null)"
+    if ! apt-get "${APT_OPTS[@]}" install --reinstall "$p=$v" >>"$LOGF" 2>&1; then
+      apt-get "${APT_OPTS[@]}" install --reinstall "$p" >>"$LOGF" 2>&1 \
+        || { red "      reinstall of $p failed. Last lines:"; tail -n 6 "$LOGF" | cut -c1-220; show_status; exit 1; }
+    fi
+  done
+  LEFT="$(find_corrupt)"
+  if [[ -n "$LEFT" ]]; then
+    red "      still zero-filled after reinstall:"; cut -f2 <<<"$LEFT" | sed 's/^/        /'
+    red "      This points to an ongoing disk/filesystem problem - check dmesg for I/O errors."; show_status; exit 1
+  fi
+  green "      corrupted files replaced (dpkg --verify clean for them)."
+  # Stale bytecode next to replaced sources is harmless (Python checks mtimes), nothing else to do.
+fi
 
 mapfile -t AUDIT < <(audit_pkgs)
 if (( ${#AUDIT[@]} )); then
