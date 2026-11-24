@@ -115,21 +115,25 @@ find_corrupt() {
 IMUNIFY_SET_RE='^(imunify|ai-bolit|rustbolit)'
 imunify_lists() { ls /var/lib/apt/lists/ 2>/dev/null | grep -cE 'imunify.*_Packages'; }
 
-# SET = installed Imunify packages + every dependency their candidate versions
-# need that apt would not pick by itself ("Depends: X ... but it is not going
-# to be installed" / "but <old> is to be installed"), found by repeated dry
-# runs. SIM_SET = the final dry-run output.
+# SET = installed Imunify packages + the extra packages given as arguments
+# (half-configured ones, ones with damaged dpkg info) + every package the dry
+# run names in an unmet dependency: both the one that is missing/too old
+# ("Depends: X ... but it is not going to be installed" / "but <old> is to be
+# installed") and the one that needs it (" pkg : Depends: ..."), found by
+# repeated dry runs. SIM_SET = the final dry-run output.
 SET=(); SIM_SET=""
 # While Imunify packages are still on hold (check mode, before the fix lifts
 # them) the dry run simulates as if they were not.
 SIM_HOLD=()
 plan_set() {
   local i n add new
-  mapfile -t SET < <(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk '$1 ~ /^[ih]/ && substr($1,2,1) != "n" {print $2}' | grep -E "$IMUNIFY_SET_RE")
+  mapfile -t SET < <( { dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk '$1 ~ /^[ih]/ && substr($1,2,1) != "n" {print $2}' | grep -E "$IMUNIFY_SET_RE"
+                        printf '%s\n' "$@"; } | grep -v '^$' | sed 's/:.*//' | awk '!seen[$0]++')
   (( ${#SET[@]} )) || return 0
   for i in 1 2 3 4 5 6; do
     SIM_SET="$(apt-get -s -o Debug::NoLocking=1 "${SIM_HOLD[@]}" install "${SET[@]}" 2>&1)"
-    add="$(grep -E 'Depends: .* but ' <<<"$SIM_SET" | grep -oP 'Depends: \K[a-z0-9][a-z0-9.+-]*' | sort -u)"
+    add="$( { grep -E 'Depends: .* but ' <<<"$SIM_SET" | grep -oP 'Depends: \K[a-z0-9][a-z0-9.+-]*'
+              grep -oP '^\s+\K[a-z0-9][a-z0-9.+-]*(?=(:[a-z0-9]+)? : (Pre)?Depends:)' <<<"$SIM_SET"; } | sort -u)"
     new=()
     for n in $add; do printf '%s\n' "${SET[@]}" | grep -qxF "$n" || new+=("$n"); done
     (( ${#new[@]} )) || break
@@ -391,7 +395,7 @@ if (( LISTS_MISSING )); then
   yellow "  Imunify repo lists are missing, so this dry run only sees installed versions."
   yellow "  The fix runs apt-get update first and re-plans; run --check again after an apt-get update for an exact plan."
 fi
-plan_set
+plan_set "${AUDIT[@]}" "${ZINFO_PKGS[@]}"
 if (( ${#SET[@]} )); then
   echo "  Imunify set: apt-get install ${SET[*]}"
   if grep -q '^E:' <<<"$SIM_SET"; then
@@ -482,7 +486,7 @@ fi
 (( LISTS_MISSING )) && fixed "Imunify repo package lists restored ($(imunify_lists) list file(s))"
 
 echo "[3/6] install the Imunify package set"
-plan_set
+plan_set "${AUDIT[@]}" "${ZINFO_PKGS[@]}"
 if grep -q '^E:' <<<"$SIM_SET"; then
   red "      apt still cannot resolve the Imunify set:"
   grep -E '^E:|Depends: .* but ' <<<"$SIM_SET" | head -n 6 | sed 's/^/        /'
