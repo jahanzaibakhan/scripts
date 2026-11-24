@@ -9,6 +9,9 @@
 #   - two entries glued on one line ("Error in applying operation
 #     '+@alluser'") -> split back into separate lines
 #   - CRLF line endings / blank lines -> cleaned
+#   - the log directory (e.g. /var/log/redis) deleted, so Redis aborts with
+#     "FATAL CONFIG FILE ERROR ... Can't open the log file" -> recreated
+#     as redis:adm 2750 (Debian default)
 # The merged file is test-loaded in a throw-away redis-server (no TCP port,
 # no persistence) before it replaces the real one; the original is kept as
 # users.acl.pre-fix-<timestamp>. Then redis-server is started (if it was down)
@@ -84,6 +87,7 @@ echo "ACL file  : ${ACL:-none configured}"
 
 if [[ -z "$ACL" ]]; then
   echo "RESULT: no aclfile in $CONF - nothing for this script to fix."
+  [[ "$LOG" == /* && ! -d "$(dirname "$LOG")" ]] && red "But the log directory $(dirname "$LOG") is missing - fix: install -d -o redis -g adm -m 2750 $(dirname "$LOG") && systemctl reset-failed $SVC && systemctl start $SVC"
   show_status; exit 3
 fi
 [[ -f "$ACL" ]] || die "$ACL is configured but does not exist."
@@ -154,8 +158,19 @@ if [[ -n "$HOLDER" ]] && ! systemctl is-active --quiet "$SVC"; then
   ISSUES+=("PORT: port $PORT is in use by PID $HPID - this script does not stop it; redis-server will not start until it is gone.")
 fi
 
+# Log directory deleted (e.g. by a disk cleanup): Redis exits at once with
+# "FATAL CONFIG FILE ERROR ... Can't open the log file".
+LOGDIR="$(dirname "$LOG")"; LOGDIR_FIX=0
+if [[ "$LOG" == /* && ! -d "$LOGDIR" ]]; then
+  echo "Log dir   : $LOGDIR is missing (logfile $LOG)"
+  LOGERR="$(journalctl -u "$SVC" -n 30 -o cat --no-pager 2>/dev/null | grep -m1 "Can't open the log file")"
+  [[ -n "$LOGERR" ]] && red "Last start error: $LOGERR"
+  ISSUES+=("LOGDIR: $LOGDIR does not exist - Redis cannot open its log file and aborts; it will be recreated.")
+  LOGDIR_FIX=1
+fi
+
 if (( ${#ISSUES[@]} == 0 )); then
-  green "RESULT: ACL file has no duplicate, glued or CRLF problems."
+  green "RESULT: ACL file has no duplicate, glued or CRLF problems; log directory exists."
   if ! is_up; then
     red "$SVC is not running for another reason. Last log lines:"
     grep -vE 'overcommit|oO0Oo|Supervised|Configuration loaded|monotonic' "$LOG" 2>/dev/null | tail -n 5 | cut -c1-250
@@ -163,7 +178,7 @@ if (( ${#ISSUES[@]} == 0 )); then
   show_status; exit 0
 fi
 
-red "RESULT: ACL ISSUE FOUND - this is why redis-server will not start:"
+red "RESULT: ISSUE FOUND - this is why redis-server will not start:"
 for i in "${ISSUES[@]}"; do red "  - $i"; done
 echo
 
@@ -201,30 +216,42 @@ if [[ $MODE == check ]]; then
   show_status; exit 0
 fi
 
-(( ACL_FIXABLE )) || { echo "Nothing this script can change (see PORT above). No changes made."; show_status; exit 2; }
+(( ACL_FIXABLE || LOGDIR_FIX )) || { echo "Nothing this script can change (see PORT above). No changes made."; show_status; exit 2; }
 
+LOGGRP=adm; getent group adm >/dev/null || LOGGRP=redis
 echo
 echo "The fix will:"
-echo "  1. copy $ACL -> $ACL.pre-fix-<timestamp>"
-echo "  2. replace it with the fixed version (same owner/permissions)"
+(( LOGDIR_FIX )) && echo "  - create $LOGDIR (owner redis:$LOGGRP, mode 2750)"
+if (( ACL_FIXABLE )); then
+  echo "  - copy $ACL -> $ACL.pre-fix-<timestamp>"
+  echo "  - replace it with the fixed version (same owner/permissions)"
+fi
 if is_up; then
-  echo "  3. leave the running redis-server alone (the file is used at its next restart)"
+  echo "  - leave the running redis-server alone (changes are used at its next restart)"
 else
-  echo "  3. reset-failed and start $SVC"
+  echo "  - reset-failed and start $SVC"
 fi
 confirm "Apply the fix?" || die "Aborted. No changes made."
 echo
 
-BAK="$ACL.pre-fix-$(date +%Y%m%d-%H%M%S)"
-cp -a "$ACL" "$BAK" || die "Backup failed. No changes made."
-echo "Backup: $BAK"
-OWN="$(stat -c '%U:%G' "$ACL")"; MOD="$(stat -c '%a' "$ACL")"
-install -o "${OWN%%:*}" -g "${OWN##*:}" -m "$MOD" "$TMPD/fixed.acl" "$ACL" || { cp -a "$BAK" "$ACL"; die "Writing $ACL failed - original restored."; }
-echo "Wrote $ACL ($(wc -l < "$ACL") users, $OWN, $MOD)."
+if (( LOGDIR_FIX )); then
+  install -d -o redis -g "$LOGGRP" -m 2750 "$LOGDIR" || die "Could not create $LOGDIR."
+  echo "Created $LOGDIR ($(stat -c '%U:%G %a' "$LOGDIR"))."
+fi
+
+BAK=""
+if (( ACL_FIXABLE )); then
+  BAK="$ACL.pre-fix-$(date +%Y%m%d-%H%M%S)"
+  cp -a "$ACL" "$BAK" || die "Backup failed. ACL file not changed."
+  echo "Backup: $BAK"
+  OWN="$(stat -c '%U:%G' "$ACL")"; MOD="$(stat -c '%a' "$ACL")"
+  install -o "${OWN%%:*}" -g "${OWN##*:}" -m "$MOD" "$TMPD/fixed.acl" "$ACL" || { cp -a "$BAK" "$ACL"; die "Writing $ACL failed - original restored."; }
+  echo "Wrote $ACL ($(wc -l < "$ACL") users, $OWN, $MOD)."
+fi
 
 if is_up; then
   show_status
-  green "SUCCESS: ACL file fixed. $SVC is RUNNING (it was already up and was not restarted)."
+  green "SUCCESS: fixed. $SVC is RUNNING (it was already up and was not restarted)."
   exit 0
 fi
 
@@ -242,7 +269,7 @@ for _ in $(seq 1 15); do is_up && break; sleep 1; done
 echo
 if is_up; then
   command -v monit >/dev/null && monit monitor redis >/dev/null 2>&1
-  echo "Original ACL kept at $BAK"
+  [[ -n "$BAK" ]] && echo "Original ACL kept at $BAK"
   show_status
   green "SUCCESS: $SVC is RUNNING (redis-cli ping: $(ping_redis))."
   exit 0
@@ -250,5 +277,5 @@ fi
 
 red "FAILED: $SVC is still not running. Newest log lines:" >&2
 grep -vE 'overcommit|oO0Oo|Supervised|Configuration loaded|monotonic' "$LOG" 2>/dev/null | tail -n 5 | cut -c1-300 >&2
-echo "To restore the original ACL: install -o ${OWN%%:*} -g ${OWN##*:} -m $MOD $BAK $ACL" >&2
+[[ -n "$BAK" ]] && echo "To restore the original ACL: install -o ${OWN%%:*} -g ${OWN##*:} -m $MOD $BAK $ACL" >&2
 show_status; exit 1
