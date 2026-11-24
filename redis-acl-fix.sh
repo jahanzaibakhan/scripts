@@ -190,7 +190,9 @@ if [[ -f "$RDB" ]]; then
       if (( rc == 124 )); then
         yellow "redis-check-rdb timed out after 300s - relying on the Redis log only."
       elif (( rc != 0 )) || grep -q 'RDB ERROR DETECTED' <<<"$RDBCHK_OUT"; then
-        RDBCHK="$(grep -m1 -iE 'error|invalid|short read|wrong' <<<"$RDBCHK_OUT" | cut -c1-250)"
+        RDBCHK="$(grep -m1 -E 'Internal error|Invalid|Short read|Wrong|Unexpected EOF|Can.t handle' <<<"$RDBCHK_OUT" | cut -c1-250)"
+        [[ -z "$RDBCHK" ]] && RDBCHK="$(grep -m1 -iE 'error' <<<"$RDBCHK_OUT" | cut -c1-250)"
+        RDBCHK="${RDBCHK#*# }"
         RDBCHK="${RDBCHK:-redis-check-rdb exit code $rc}"
       else
         green "RDB file  : redis-check-rdb reports it OK"
