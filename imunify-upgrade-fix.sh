@@ -20,12 +20,25 @@
 #     -> moved to a backup folder and the package reinstalled
 #   - disk full on /var: shows what uses the space and offers a safe cleanup
 #     (apt cache, journal above 100 MB, already-rotated logs) before the fix
-# Fix: dpkg --configure -a, apt-get -f install (retried once with
-# --force-overwrite ONLY when every conflict is between Imunify packages),
-# reinstall packages with corrupted files at their INSTALLED version,
-# remove the stale marker, start imunify360 / agent socket / aibolit-resident
-# (webshield and antivirus are never started or unmasked by this script - the
-# Imunify agent manages them), re-enable monit, then show the status.
+#   - apt package lists for the Imunify repo missing (wiped by an
+#     "apt-get update" on a full disk): apt then only knows the installed
+#     versions, so the newer imunify-core can never be installed and
+#     "apt-get -f install" would REMOVE imunify360-firewall/antivirus/ui
+#     -> apt-get update first; this script never lets apt remove Imunify
+#   - Imunify packages out of step ("ImportError: cannot import name
+#     'MalwareTune'": imunify-core older than firewall/antivirus) and new
+#     dependencies apt does not pull in by itself on a broken system
+#     (imunify-agent-proxy, a newer imunify360-webshield-bundle) -> the whole
+#     installed Imunify set is installed together, plus every dependency the
+#     apt dry run names, checked by simulation before anything runs
+#   - stale bytecode ("ValueError: bad marshal data") -> __pycache__ cleared
+# Fix: dpkg --configure -a, apt-get update, install the Imunify package set
+# (retried once with --force-overwrite ONLY when every conflict is between
+# Imunify packages), reinstall packages with corrupted files at their
+# INSTALLED version, remove the stale marker, start imunify360 / agent socket
+# / aibolit-resident (webshield and antivirus are never started or unmasked by
+# this script - the Imunify agent manages them), re-enable monit, then show
+# the status. Each issue is printed in red and each fix in green.
 #
 # Usage (as root):
 #   bash imunify-upgrade-fix.sh            # check, confirm, fix
@@ -91,6 +104,39 @@ find_corrupt() {
     (( n == 0 )) || continue
     printf '%s\t%s\n' "$(dpkg -S "$f" 2>/dev/null | head -n1 | cut -d: -f1)" "$f"
   done
+}
+
+# Packages installed together as one set (same as Cloudways' own upgrade).
+IMUNIFY_SET_RE='^(imunify|ai-bolit|rustbolit)'
+imunify_lists() { ls /var/lib/apt/lists/ 2>/dev/null | grep -cE 'imunify.*_Packages'; }
+
+# SET = installed Imunify packages + every dependency their candidate versions
+# need that apt would not pick by itself ("Depends: X ... but it is not going
+# to be installed" / "but <old> is to be installed"), found by repeated dry
+# runs. SIM_SET = the final dry-run output.
+SET=(); SIM_SET=""
+plan_set() {
+  local i n add new
+  mapfile -t SET < <(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk '$1 ~ /^i/{print $2}' | grep -E "$IMUNIFY_SET_RE")
+  (( ${#SET[@]} )) || return 0
+  for i in 1 2 3 4 5 6; do
+    SIM_SET="$(apt-get -s -o Debug::NoLocking=1 install "${SET[@]}" 2>&1)"
+    add="$(grep -E 'Depends: .* but ' <<<"$SIM_SET" | grep -oP 'Depends: \K[a-z0-9][a-z0-9.+-]*' | sort -u)"
+    new=()
+    for n in $add; do printf '%s\n' "${SET[@]}" | grep -qxF "$n" || new+=("$n"); done
+    (( ${#new[@]} )) || break
+    SET+=("${new[@]}")
+  done
+}
+removes_imunify() { awk '/^Remv/{print $2}' <<<"$1" | grep -E "$IMUNIFY_PKG_RE" | tr '\n' ' '; }
+
+FIXED=()
+fixed() { FIXED+=("$1"); green "      FIXED: $1"; }
+summary() {
+  hr
+  echo "== Summary"
+  for i in "${ISSUES[@]}"; do red   "  ISSUE : $i"; done
+  for f in "${FIXED[@]}";  do green "  FIXED : $f"; done
 }
 
 unit_load()  { systemctl show -p LoadState --value "$1" 2>/dev/null; }      # loaded / masked / not-found
@@ -176,6 +222,31 @@ ZINFO_PKGS=()
 if (( ${#ZINFO[@]} )); then
   mapfile -t ZINFO_PKGS < <(for f in "${ZINFO[@]}"; do b="${f##*/}"; b="${b%.*}"; echo "${b%%:*}"; done | sort -u)
   ISSUES+=("DPKG-DB: ${#ZINFO[@]} zero-filled file(s) in /var/lib/dpkg/info for: ${ZINFO_PKGS[*]} - apt fails on them; will move them aside and reinstall those packages.")
+fi
+
+# apt lists for the Imunify repo wiped -> apt only sees installed versions.
+LISTS_MISSING=0
+if (( $(imunify_lists) == 0 )); then
+  LISTS_MISSING=1
+  ISSUES+=("APT-LISTS: no package lists for the Imunify repo in /var/lib/apt/lists - apt only knows the installed versions, cannot upgrade imunify-core, and 'apt-get -f install' would REMOVE Imunify; will run apt-get update first.")
+fi
+
+# Imunify packages out of step / stale bytecode (only while imunify360 is down).
+MISMATCH=0; PYC=0
+if [[ "$(unit_state imunify360)" != active ]]; then
+  JRN="$(journalctl -u imunify360 -n 80 -o cat --no-pager 2>/dev/null)"
+  IMPERR="$(grep -m1 -oE "ImportError: cannot import name '[^']+'" <<<"$JRN")"
+  if [[ -z "$IMPERR" ]] && command -v imunify360-agent >/dev/null; then
+    IMPERR="$(timeout 20 imunify360-agent version 2>&1 | grep -m1 -oE "ImportError: cannot import name '[^']+'")"
+  fi
+  if [[ -n "$IMPERR" ]]; then
+    MISMATCH=1
+    ISSUES+=("MISMATCH: $IMPERR - Imunify packages are out of step (imunify-core $(dpkg-query -W -f='${Version}' imunify-core 2>/dev/null), imunify360-firewall $(dpkg-query -W -f='${Version}' imunify360-firewall 2>/dev/null)); will install the whole Imunify set together.")
+  fi
+  if grep -q 'bad marshal data' <<<"$JRN"; then
+    PYC=1
+    ISSUES+=("PYC: 'ValueError: bad marshal data' - corrupt compiled Python cache; will clear __pycache__ in /opt/imunify360/venv and /opt/alt/python-internal.")
+  fi
 fi
 
 DOWN=()
@@ -289,14 +360,27 @@ fi
 
 # Dry run: would apt be able to finish the job?
 echo
-echo "== apt dry run (apt-get -s -f install)"
-SIM="$(apt-get -s -f install 2>&1)"
-if grep -q '^E:' <<<"$SIM"; then
-  grep '^E:' <<<"$SIM" | head -n 5 | while IFS= read -r l; do red "  $l"; done
-  yellow "  The dry run reports errors; the fix may need manual work."
-else
-  echo "  OK: $(grep -c '^Inst' <<<"$SIM") to install/upgrade, $(grep -c '^Conf' <<<"$SIM") to configure, $(grep -c '^Remv' <<<"$SIM") to remove."
-  (( $(grep -c '^Remv' <<<"$SIM") )) && yellow "  Packages would be REMOVED: $(awk '/^Remv/{print $2}' <<<"$SIM" | tr '\n' ' ')"
+echo "== apt dry run"
+SIM="$(apt-get -s -o Debug::NoLocking=1 -f install 2>&1)"
+FREM="$(removes_imunify "$SIM")"
+[[ -n "$FREM" ]] && red "  'apt-get -f install' alone would REMOVE: $FREM- this script never runs it that way."
+if (( LISTS_MISSING )); then
+  yellow "  Imunify repo lists are missing, so this dry run only sees installed versions."
+  yellow "  The fix runs apt-get update first and re-plans; run --check again after an apt-get update for an exact plan."
+fi
+plan_set
+if (( ${#SET[@]} )); then
+  echo "  Imunify set: apt-get install ${SET[*]}"
+  if grep -q '^E:' <<<"$SIM_SET"; then
+    grep -E '^E:|Depends: .* but ' <<<"$SIM_SET" | head -n 6 | while IFS= read -r l; do red "  $l"; done
+    (( LISTS_MISSING )) || yellow "  The dry run reports errors; the fix may need manual work."
+  else
+    SREM="$(removes_imunify "$SIM_SET")"
+    echo "  OK: $(grep -c '^Inst' <<<"$SIM_SET") to install/upgrade, $(grep -c '^Conf' <<<"$SIM_SET") to configure, $(grep -c '^Remv' <<<"$SIM_SET") to remove."
+    grep '^Inst' <<<"$SIM_SET" | grep -E "^Inst (imunify-core|imunify360-firewall|imunify-antivirus|imunify-agent-proxy|imunify360-webshield-bundle) " \
+      | awk '{ if ($3 ~ /^\[/) {o=$3; gsub(/[][]/,"",o); n=$4} else {o="new"; n=$3}; gsub(/[(]/,"",n); print "    " $2 ": " o " -> " n }'
+    [[ -n "$SREM" ]] && red "  Would REMOVE Imunify packages: $SREM- the fix will refuse this."
+  fi
 fi
 for p in "${CORRUPT_PKGS[@]}"; do
   v="$(dpkg-query -W -f='${Version}' "$p" 2>/dev/null)"
@@ -315,52 +399,75 @@ fi
 
 echo
 echo "The fix will:"
-(( ${#ZINFO[@]} )) && echo "  0. move ${#ZINFO[@]} zero-filled /var/lib/dpkg/info file(s) to a backup folder (reinstalled in step 2)"
+(( ${#ZINFO[@]} )) && echo "  0. move ${#ZINFO[@]} zero-filled /var/lib/dpkg/info file(s) to a backup folder (reinstalled in step 3)"
 echo "  1. dpkg --configure -a"
-echo "  2. apt-get -f install (retry once with --force-overwrite only if every conflict is Imunify-vs-Imunify)"
+echo "  2. apt-get update (refresh the Imunify repo lists)"
+echo "  3. re-plan and install the Imunify package set with its new dependencies (never removing Imunify;"
+echo "     retry once with --force-overwrite only if every conflict is Imunify-vs-Imunify)"
 (( ${#CORRUPT_PKGS[@]} )) && echo "     + apt-get install --reinstall ${CORRUPT_PKGS[*]} (installed versions) to replace the zero-filled files"
-echo "  3. remove $MARKER once dpkg --audit is clean"
-echo "  4. daemon-reload and start ${START_UNITS[*]} (webshield is left to the Imunify agent)"
-echo "  5. re-enable monit for imunify-resident"
+echo "  4. remove $MARKER once dpkg --audit is clean"
+echo "  5. clear stale __pycache__ (if needed), daemon-reload and start ${START_UNITS[*]} (webshield is left to the Imunify agent)"
+echo "  6. re-enable monit for imunify-resident"
 confirm "Apply the fix?" || die "Aborted. No changes made."
 echo
 
 LOGF="/root/imunify-upgrade-fix-$(date +%Y%m%d-%H%M%S).log"
 echo "Full apt/dpkg output: $LOGF"
 
+fail_stop() { red "      $1 Last lines:"; tail -n 8 "$LOGF" | cut -c1-220
+              echo "Marker left in place. Fix the apt error above, then re-run this script."; summary; show_status; exit 1; }
+
+# apt-get with one retry using --force-overwrite, only when every
+# "trying to overwrite" conflict involves Imunify packages on both sides.
+apt_retry() {
+  apt-get "${APT_OPTS[@]}" "$@" >>"$LOGF" 2>&1 && return 0
+  local confl newp oldp
+  confl="$(tail -n 400 "$LOGF" | tr -d '\r' | grep -E "trying to overwrite .* which is also in package")"
+  newp="$(tail -n 400 "$LOGF" | tr -d '\r' | grep -oP "error processing archive \S*/\d+-\K[a-z0-9.+-]+(?=_)" | sort -u)"
+  oldp="$(grep -oP "also in package \K[a-z0-9.+-]+" <<<"$confl" | sort -u)"
+  if [[ -n "$confl" ]] && ! printf '%s\n%s\n' "$newp" "$oldp" | grep -v '^$' | grep -vqE "$IMUNIFY_PKG_RE"; then
+    yellow "      file conflict between Imunify packages ($(tr '\n' ' ' <<<"$oldp")) - retrying with --force-overwrite"
+    apt-get "${APT_OPTS[@]}" -o Dpkg::Options::=--force-overwrite "$@" >>"$LOGF" 2>&1 && return 0
+  fi
+  return 1
+}
+
 if (( ${#ZINFO[@]} )); then
   ZBK="${LOGF%.log}-dpkg-info"
-  mkdir -p "$ZBK" && mv "${ZINFO[@]}" "$ZBK"/ \
-    && echo "[0/5] moved ${#ZINFO[@]} zero-filled dpkg info file(s) to $ZBK" \
-    || { red "Could not move the zero-filled dpkg info files - stopping."; show_status; exit 1; }
+  if mkdir -p "$ZBK" && mv "${ZINFO[@]}" "$ZBK"/; then
+    fixed "moved ${#ZINFO[@]} zero-filled dpkg info file(s) to $ZBK"
+  else red "Could not move the zero-filled dpkg info files - stopping."; summary; show_status; exit 1; fi
 fi
 
-echo "[1/5] dpkg --configure -a"
-dpkg --configure -a >>"$LOGF" 2>&1 || yellow "      dpkg --configure -a reported errors (expected if a package needs a newer dependency) - continuing with apt."
+echo "[1/6] dpkg --configure -a"
+dpkg --configure -a >>"$LOGF" 2>&1 || yellow "      dpkg --configure -a reported errors (expected if a package needs a newer dependency) - continuing."
 
-echo "[2/5] apt-get -f install"
-if ! apt-get "${APT_OPTS[@]}" -f install >>"$LOGF" 2>&1; then
-  # Only retry when every "trying to overwrite" conflict involves Imunify packages on both sides.
-  CONFL="$(tail -n 400 "$LOGF" | tr -d '\r' | grep -E "trying to overwrite .* which is also in package")"
-  NEWP="$(tail -n 400 "$LOGF" | tr -d '\r' | grep -oP "error processing archive \S*/\d+-\K[a-z0-9.+-]+(?=_)" | sort -u)"
-  OLDP="$(grep -oP "also in package \K[a-z0-9.+-]+" <<<"$CONFL" | sort -u)"
-  if [[ -n "$CONFL" ]] && ! printf '%s\n%s\n' "$NEWP" "$OLDP" | grep -v '^$' | grep -vqE "$IMUNIFY_PKG_RE"; then
-    yellow "      file conflict between Imunify packages ($(tr '\n' ' ' <<<"$OLDP")) - retrying with --force-overwrite"
-    if ! apt-get "${APT_OPTS[@]}" -o Dpkg::Options::=--force-overwrite -f install >>"$LOGF" 2>&1; then
-      red "      apt-get -f install failed again. Last lines:"; tail -n 8 "$LOGF" | cut -c1-220
-      echo "Marker left in place. Fix the apt error above, then re-run this script."; show_status; exit 1
-    fi
-  else
-    red "      apt-get -f install failed (not an Imunify-only file conflict). Last lines:"; tail -n 8 "$LOGF" | cut -c1-220
-    echo "Marker left in place. Fix the apt error above, then re-run this script."; show_status; exit 1
-  fi
+echo "[2/6] apt-get update"
+apt-get update >>"$LOGF" 2>&1 || yellow "      apt-get update reported errors (see $LOGF) - continuing if the Imunify lists are there."
+if (( $(imunify_lists) == 0 )); then
+  fail_stop "Imunify repo lists are still missing after apt-get update (repo unreachable or disk full?)."
 fi
+(( LISTS_MISSING )) && fixed "Imunify repo package lists restored ($(imunify_lists) list file(s))"
+
+echo "[3/6] install the Imunify package set"
+plan_set
+if grep -q '^E:' <<<"$SIM_SET"; then
+  red "      apt still cannot resolve the Imunify set:"
+  grep -E '^E:|Depends: .* but ' <<<"$SIM_SET" | head -n 6 | sed 's/^/        /'
+  echo "Marker left in place - nothing installed."; summary; show_status; exit 1
+fi
+SREM="$(removes_imunify "$SIM_SET")"
+[[ -n "$SREM" ]] && { red "      the plan would REMOVE Imunify packages ($SREM) - refusing."; echo "Marker left in place - nothing installed."; summary; show_status; exit 1; }
+echo "      apt-get install ${SET[*]}"
+apt_retry install "${SET[@]}" || fail_stop "installing the Imunify set failed."
 dpkg --configure -a >>"$LOGF" 2>&1
+fixed "Imunify set installed: $(for p in imunify-core imunify360-firewall imunify-antivirus; do v=$(dpkg-query -W -f='${Version}' "$p" 2>/dev/null) && printf '%s %s, ' "$p" "$v"; done | sed 's/, $//')"
 
 if (( ${#ZINFO_PKGS[@]} )); then
   echo "      reinstalling packages whose dpkg info files were zero-filled: ${ZINFO_PKGS[*]}"
   apt-get "${APT_OPTS[@]}" install --reinstall "${ZINFO_PKGS[@]}" >>"$LOGF" 2>&1 \
-    || { red "      reinstall of ${ZINFO_PKGS[*]} failed. Last lines:"; tail -n 6 "$LOGF" | cut -c1-220; show_status; exit 1; }
+    || fail_stop "reinstall of ${ZINFO_PKGS[*]} failed."
+  fixed "dpkg info files rewritten by reinstalling ${ZINFO_PKGS[*]}"
 fi
 
 if (( ${#CORRUPT_PKGS[@]} )); then
@@ -368,30 +475,36 @@ if (( ${#CORRUPT_PKGS[@]} )); then
   for p in "${CORRUPT_PKGS[@]}"; do
     v="$(dpkg-query -W -f='${Version}' "$p" 2>/dev/null)"
     if ! apt-get "${APT_OPTS[@]}" install --reinstall "$p=$v" >>"$LOGF" 2>&1; then
-      apt-get "${APT_OPTS[@]}" install --reinstall "$p" >>"$LOGF" 2>&1 \
-        || { red "      reinstall of $p failed. Last lines:"; tail -n 6 "$LOGF" | cut -c1-220; show_status; exit 1; }
+      apt-get "${APT_OPTS[@]}" install --reinstall "$p" >>"$LOGF" 2>&1 || fail_stop "reinstall of $p failed."
     fi
   done
   LEFT="$(find_corrupt)"
   if [[ -n "$LEFT" ]]; then
     red "      still zero-filled after reinstall:"; cut -f2 <<<"$LEFT" | sed 's/^/        /'
-    red "      This points to an ongoing disk/filesystem problem - check dmesg for I/O errors."; show_status; exit 1
+    red "      This points to an ongoing disk/filesystem problem - check dmesg for I/O errors."; summary; show_status; exit 1
   fi
-  green "      corrupted files replaced (dpkg --verify clean for them)."
-  # Stale bytecode next to replaced sources is harmless (Python checks mtimes), nothing else to do.
+  fixed "zero-filled files replaced in ${CORRUPT_PKGS[*]} (dpkg --verify clean)"
 fi
 
 mapfile -t AUDIT < <(audit_pkgs)
 if (( ${#AUDIT[@]} )); then
   red "      dpkg --audit still lists: ${AUDIT[*]}"
-  echo "Marker left in place. Check $LOGF, then re-run this script."; show_status; exit 1
+  echo "Marker left in place. Check $LOGF, then re-run this script."; summary; show_status; exit 1
 fi
-green "      packages configured, dpkg --audit is clean."
+fixed "all packages configured, dpkg --audit is clean"
 
-echo "[3/5] remove stale marker"
-if [[ -e "$MARKER" ]]; then rm -f "$MARKER" && echo "      removed $MARKER"; else echo "      already gone (removed by the package scripts)"; fi
+echo "[4/6] remove stale marker"
+if [[ -e "$MARKER" ]]; then
+  rm -f "$MARKER" && fixed "removed $MARKER - systemd no longer skips imunify360"
+else echo "      already gone (removed by the package scripts)"; fi
 
-echo "[4/5] start Imunify units"
+echo "[5/6] start Imunify units"
+# Bytecode can be zero-filled like the sources ("bad marshal data"); after an
+# upgrade it is rebuilt anyway, so clearing it is safe.
+if (( PYC || MISMATCH || ${#CORRUPT_PKGS[@]} )); then
+  find /opt/imunify360/venv /opt/alt/python-internal -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null
+  fixed "cleared __pycache__ in /opt/imunify360/venv and /opt/alt/python-internal (rebuilt on start)"
+fi
 systemctl daemon-reload
 for u in "${START_UNITS[@]}"; do
   [[ "$(unit_load "$u")" == loaded ]] || continue
@@ -402,17 +515,19 @@ for u in "${START_UNITS[@]}"; do
 done
 for _ in $(seq 1 45); do [[ "$(unit_state imunify360)" == active ]] && break; sleep 2; done
 
-echo "[5/5] monit"
+echo "[6/6] monit"
 if command -v monit >/dev/null; then
   monit monitor imunify-resident >/dev/null 2>&1 && echo "      monit monitor imunify-resident"
 fi
 
 echo
-show_status
 if [[ "$(unit_state imunify360)" == active ]]; then
+  fixed "imunify360 is running ($(timeout 20 imunify360-agent version 2>/dev/null | grep -E '[0-9]+\.[0-9]+' | tail -n1))"
+  summary; show_status
   green "SUCCESS: Imunify360 is RUNNING again."
   exit 0
 fi
+summary; show_status
 red "imunify360 did not come up. Last log lines:"
 journalctl -u imunify360 -n 15 -o cat --no-pager 2>/dev/null | cut -c1-220
 exit 1
