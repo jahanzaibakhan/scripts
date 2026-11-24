@@ -47,8 +47,12 @@ confirm() {
 
 # --- Service, datadir, error log --------------------------------------------
 SVC=""
+# No "| grep -q" here: with pipefail, grep exiting early makes the pipe fail.
 for s in mariadb mysql; do
-  systemctl list-unit-files "$s.service" 2>/dev/null | grep -q "^$s.service" && { SVC=$s; break; }
+  if [[ "$(systemctl show -p LoadState --value "$s.service" 2>/dev/null)" == loaded ]]; then
+    SVC="$(systemctl show -p Id --value "$s.service" 2>/dev/null)"; SVC="${SVC%.service}"
+    break
+  fi
 done
 [[ -n "$SVC" ]] || die "No mariadb.service or mysql.service found."
 
