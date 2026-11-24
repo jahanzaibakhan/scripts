@@ -127,6 +127,10 @@ done
 shopt -u nullglob
 # Point every absolute include into the sandbox.
 find "$SB" -name '*.vcl' -type f -exec sed -i "s#include \"/#include \"$SB/#g" {} +
+# varnishd -C drops privileges to the varnish user, so the sandbox must be
+# readable by it. The admin secret is not needed to compile - never copy it.
+rm -f "$SB/etc/varnish/secret"
+chmod 755 "$TMP"; chmod -R a+rX "$SB" "$TMP/work"
 SBVCL="$SB$VCL"
 
 # --- Fix loop, inside the sandbox only -----------------------------------------------
@@ -149,10 +153,11 @@ for ((round=1; round<=MAX_ROUNDS; round++)); do
       # Exists for real, just not copied into the sandbox yet (include outside the usual places).
       mkdir -p "$(dirname "$MISSING")"; cp -a "$RM" "$MISSING"
       sed -i "s#include \"/#include \"$SB/#g" "$MISSING"
+      chmod -R a+rX "$SB"
       continue
     fi
     if [[ "$RM" =~ $APP_RE ]]; then
-      mkdir -p "$(dirname "$MISSING")" && : > "$MISSING"
+      mkdir -p "$(dirname "$MISSING")" && : > "$MISSING" && chmod -R a+rX "$SB"
       NEWFILES+=("$RM"); note_changed "$RM"
       ACTIONS+=("CREATE empty $RM (included by ${RLOCFILE} line ${LOCLINE}; the app's conf/ file is missing - deleted or half-deleted app)")
       continue
