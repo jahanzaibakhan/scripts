@@ -12,9 +12,9 @@
 #     "trying to overwrite '...', which is also in package imunify-..."
 # Fix: dpkg --configure -a, apt-get -f install (retried once with
 # --force-overwrite ONLY when every conflict is between Imunify packages),
-# remove the stale marker, start the Imunify units that are not masked
-# (masked units such as webshield/antivirus are left masked on purpose),
-# re-enable monit, then show the status.
+# remove the stale marker, start imunify360 / agent socket / aibolit-resident
+# (webshield and antivirus are never started or unmasked by this script - the
+# Imunify agent manages them), re-enable monit, then show the status.
 #
 # Usage (as root):
 #   bash imunify-upgrade-fix.sh            # check, confirm, fix
@@ -56,6 +56,10 @@ confirm() {
 
 MARKER=/var/lib/rpm-state/imunify360-transaction-in-progress
 UNITS=(imunify360 imunify360-agent.socket aibolit-resident imunify360-webshield imunify360-pam imunify-antivirus imunify-auditd-log-reader)
+# Units this script starts. webshield/antivirus are left to the Imunify agent
+# (it starts webshield itself when enabled in its config; the webshield-bundle
+# upgrade can also remove an old mask on its own).
+START_UNITS=(imunify360 imunify360-agent.socket aibolit-resident)
 # Packages whose file conflicts with each other are safe to --force-overwrite.
 IMUNIFY_PKG_RE='^(imunify|ai-bolit|rustbolit|alt-|cloudlinux-backup-utils|app-version-detector)'
 export DEBIAN_FRONTEND=noninteractive
@@ -124,7 +128,7 @@ if (( ${#AUDIT[@]} )); then
 fi
 
 DOWN=()
-for u in "${UNITS[@]}"; do
+for u in "${START_UNITS[@]}"; do
   l="$(unit_load "$u")"
   [[ "$l" == loaded ]] || continue
   [[ "$(systemctl is-enabled "$u" 2>/dev/null)" =~ ^(enabled|static|indirect)$ ]] || continue
@@ -192,7 +196,7 @@ echo "The fix will:"
 echo "  1. dpkg --configure -a"
 echo "  2. apt-get -f install (retry once with --force-overwrite only if every conflict is Imunify-vs-Imunify)"
 echo "  3. remove $MARKER once dpkg --audit is clean"
-echo "  4. daemon-reload and start the enabled, non-masked Imunify units"
+echo "  4. daemon-reload and start ${START_UNITS[*]} (webshield is left to the Imunify agent)"
 echo "  5. re-enable monit for imunify-resident"
 confirm "Apply the fix?" || die "Aborted. No changes made."
 echo
@@ -234,7 +238,7 @@ if [[ -e "$MARKER" ]]; then rm -f "$MARKER" && echo "      removed $MARKER"; els
 
 echo "[4/5] start Imunify units"
 systemctl daemon-reload
-for u in "${UNITS[@]}"; do
+for u in "${START_UNITS[@]}"; do
   [[ "$(unit_load "$u")" == loaded ]] || continue
   [[ "$(systemctl is-enabled "$u" 2>/dev/null)" =~ ^(enabled|static|indirect)$ ]] || continue
   [[ "$(unit_state "$u")" == active ]] && continue
