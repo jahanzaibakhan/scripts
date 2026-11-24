@@ -26,6 +26,13 @@ set -uo pipefail
 die()  { echo "ERROR: $*" >&2; exit 1; }
 hr()   { echo "------------------------------------------------------------"; }
 
+# Colours only when writing to a terminal (also true for `curl ... | bash`).
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  RED=$'\e[1;31m'; GRN=$'\e[1;32m'; RST=$'\e[0m'
+else
+  RED=""; GRN=""; RST=""
+fi
+
 MODE=fix; ASSUME_YES=0
 for a in "$@"; do
   case "$a" in
@@ -88,6 +95,12 @@ show_status() {
   if command -v monit >/dev/null; then
     printf 'monit           : '; monit summary 2>/dev/null | grep -iE '^\s*(mysql|mariadb)\b' | sed 's/^ *//' || echo "n/a"
   fi
+  echo
+  if is_up; then
+    echo "MySQL state     : ${GRN}RUNNING${RST} ($SVC active, answering ping)"
+  else
+    echo "MySQL state     : ${RED}NOT RUNNING${RST} ($SVC: $(systemctl is-active "$SVC" 2>/dev/null))"
+  fi
   hr
 }
 
@@ -99,7 +112,7 @@ echo "Error log : $ERRLOG"
 
 if is_up; then
   echo
-  echo "RESULT: $SVC is running and answering ping. Nothing to fix."
+  echo "RESULT: ${GRN}$SVC is running and answering ping${RST}. Nothing to fix."
   show_status
   exit 0
 fi
@@ -107,9 +120,26 @@ fi
 LOG="$(recent_log)"
 match() { grep -E "$1" <<<"$LOG" | tail -n "${2:-5}"; }
 
+# Aria detection runs first so step 1 can report it.
+LOCKMSG="$(match "Can't lock aria control file|aria_log_control.*error: ?11|Unable to lock .*ibdata1|lock wait timeout.*aria" 3)"
+ARIA_RE="Aria engine: (log initialization failed|.*(error|failed|corrupt))|Aria recovery failed|Plugin 'Aria' (init function returned error|registration as a STORAGE ENGINE failed)|Unknown storage engine 'Aria'|Could not open mysql\.plugin table.*Aria|aria_log(_control)?.*(Wrong|corrupt|bad|incorrect|error)|Got error [0-9]+ .*aria_log|Error in Aria"
+ARIA_LINES="$(match "$ARIA_RE" 6)"
+shopt -s nullglob
+ARIA_FILES=("$DATADIR"/aria_log_control "$DATADIR"/aria_log.[0-9]*)
+shopt -u nullglob
+
 # --- Findings ----------------------------------------------------------------
 echo
 echo "== Findings"
+if [[ -n "$ARIA_LINES" ]]; then
+  if [[ -n "$LOCKMSG" ]]; then
+    echo "Aria log issue : ${RED}YES - Aria errors in the log (caused by a file lock, logs not corrupt)${RST}"
+  else
+    echo "Aria log issue : ${RED}YES - Aria log corruption/initialisation errors found${RST}"
+  fi
+else
+  echo "Aria log issue : ${GRN}no${RST} (no Aria errors in the last start attempt)"
+fi
 ISSUES=()     # things this script fixes
 BLOCKERS=()   # things it does not fix
 
@@ -140,7 +170,6 @@ for p in $(pgrep -x 'mariadbd|mysqld' 2>/dev/null) $HOLDERS; do
   [[ " ${STRAY[*]:-} " == *" $p "* ]] && continue
   STRAY+=("$p")
 done
-LOCKMSG="$(match "Can't lock aria control file|aria_log_control.*error: ?11|Unable to lock .*ibdata1|lock wait timeout.*aria" 3)"
 if (( ${#STRAY[@]} )); then
   echo "Stray DB  : ${#STRAY[@]} process(es) outside systemd:"
   for p in "${STRAY[@]}"; do ps -o pid=,user=,etime=,cmd= -p "$p" | sed 's/^/            /'; done
@@ -152,11 +181,6 @@ elif [[ -n "$LOCKMSG" ]]; then
 fi
 
 # 3. Aria log problems.
-ARIA_RE="Aria engine: (log initialization failed|.*(error|failed|corrupt))|Aria recovery failed|Plugin 'Aria' (init function returned error|registration as a STORAGE ENGINE failed)|Unknown storage engine 'Aria'|Could not open mysql\.plugin table.*Aria|aria_log(_control)?.*(Wrong|corrupt|bad|incorrect|error)|Got error [0-9]+ .*aria_log|Error in Aria"
-ARIA_LINES="$(match "$ARIA_RE" 6)"
-shopt -s nullglob
-ARIA_FILES=("$DATADIR"/aria_log_control "$DATADIR"/aria_log.[0-9]*)
-shopt -u nullglob
 if (( ${#ARIA_FILES[@]} )); then
   echo "Aria files: ${#ARIA_FILES[@]} in $DATADIR ($(du -ch "${ARIA_FILES[@]}" 2>/dev/null | tail -n1 | cut -f1))"
 else
@@ -280,7 +304,7 @@ for _ in $(seq 1 60); do is_up && break; sleep 2; done
 
 echo
 if is_up; then
-  echo "SUCCESS: $SVC is running and answering ping."
+  echo "${GRN}SUCCESS: $SVC is running and answering ping.${RST}"
   # Aria tables that were open at the crash can be marked crashed.
   CRASHED="$( { journalctl -u "$SVC" --since '-5 min' -o cat --no-pager 2>/dev/null; tail -n 200 "$ERRLOG" 2>/dev/null; } \
               | grep -iE "marked as crashed|should be repaired" | sort -u | tail -n 5)"
@@ -294,7 +318,7 @@ if is_up; then
   exit 0
 fi
 
-echo "FAILED: $SVC is still not running. Newest log lines:" >&2
+echo "${RED}FAILED: $SVC is still not running.${RST} Newest log lines:" >&2
 { journalctl -u "$SVC" --since '-3 min' -o cat --no-pager 2>/dev/null; tail -n 30 "$ERRLOG" 2>/dev/null; } \
   | grep -E "\[ERROR\]|Aria|InnoDB|Failed" | tail -n 15 | cut -c1-220 >&2
 if [[ -n "$BACKUP" ]]; then
