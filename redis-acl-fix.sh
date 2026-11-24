@@ -142,7 +142,8 @@ ISSUES=()
 [[ -n "$CONFLICT" ]] && yellow "WARNING: these users are both 'on' and 'off' in different lines; after merging the last one wins: $(tr '\n' ' ' <<<"$CONFLICT")"
 
 LASTERR="$(grep -h 'ACL errors' "$LOG" 2>/dev/null | tail -n1 | cut -c1-300)"
-[[ -n "$LASTERR" ]] && red "Last ACL error in log: ${LASTERR#*# }"
+# Only shown when the file has a problem now (old log lines outlive a fix).
+(( GLUED > 0 || NDUPS > 0 || CRLF > 0 )) && [[ -n "$LASTERR" ]] && red "Last ACL error in log: ${LASTERR#*# }"
 
 HOLDER="$(ss -ltnp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p"$"{print $6}' | head -n1)"
 if [[ -n "$HOLDER" ]] && ! systemctl is-active --quiet "$SVC"; then
