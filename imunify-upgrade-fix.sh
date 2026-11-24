@@ -84,7 +84,7 @@ show_status() {
   printf '  %-28s %s\n' "dpkg --audit" "$(n=$(audit_pkgs | wc -l); (( n )) && echo "${RED}$n package(s) not configured${RST}" || echo "${GREEN}clean${RST}")"
   command -v monit >/dev/null && monit summary 2>/dev/null | grep -iE '^\s*imunify' | sed 's/^ */  monit: /'
   command -v imunify360-agent >/dev/null && [[ "$(unit_state imunify360)" == active ]] && \
-    printf '  %-28s %s\n' "agent version" "$(timeout 20 imunify360-agent version 2>/dev/null | tail -n1)"
+    printf '  %-28s %s\n' "agent version" "$(timeout 20 imunify360-agent version 2>/dev/null | grep -E '[0-9]+\.[0-9]+' | tail -n1)"
   hr
   if [[ "$(unit_state imunify360)" == active ]]; then green "IMUNIFY STATUS: RUNNING"; else red "IMUNIFY STATUS: NOT RUNNING"; fi
 }
